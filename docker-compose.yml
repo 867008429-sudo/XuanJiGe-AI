@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  xuanjige:
+    build: .
+    container_name: xuanjige
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    env_file:
+      - .env
+    volumes:
+      - db-data:/app/data
+      - ./app.py:/app/app.py
+      - ./bazi_engine.py:/app/bazi_engine.py
+      - ./ai_service.py:/app/ai_service.py
+      - ./db.py:/app/db.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://127.0.0.1:8888/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  db-data:

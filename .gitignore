@@ -1,0 +1,18 @@
+# 环境与密钥（绝不入库）
+.env
+
+# 数据库
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 测试与临时产物
+.screenshots/
+.uploads/
+*.log
