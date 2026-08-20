@@ -608,6 +608,63 @@ INDEX_HTML = r'''
             min-height: 44px; -webkit-appearance: none; width: 100%; box-sizing: border-box;
         }
         .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--gold); }
+        .birth-picker-trigger {
+            width: 100%; min-height: 56px; padding: 0.75rem 0.85rem;
+            border: 1px solid var(--border); border-radius: 10px; background: var(--bg-dark);
+            color: var(--text); font-family: inherit; text-align: left; cursor: pointer;
+            display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+            transition: border-color 0.22s ease, background 0.22s ease, transform 0.18s ease;
+            touch-action: manipulation;
+        }
+        .birth-picker-trigger:hover { border-color: var(--gold-border); background: var(--bg-card-hover); }
+        .birth-picker-trigger:active { transform: scale(0.99); }
+        .birth-picker-trigger:focus-visible { outline: 2px solid var(--gold-bright); outline-offset: 3px; }
+        .birth-picker-value { color: var(--gold-bright); font-size: 1rem; line-height: 1.4; }
+        .birth-picker-trigger.is-empty .birth-picker-value { color: var(--text-dim); }
+        .birth-picker-hint { color: var(--text-dim); font-size: 0.75rem; white-space: nowrap; }
+        .birth-picker-overlay {
+            display: none; position: fixed; inset: 0; z-index: 260; background: var(--modal-scrim);
+            align-items: flex-end; justify-content: center; padding: 0 0 env(safe-area-inset-bottom, 0px);
+        }
+        .birth-picker-overlay.active { display: flex; }
+        .birth-picker-sheet {
+            width: 100%; max-width: 560px; background: var(--bg-card);
+            border: 1px solid var(--border); border-bottom: 0;
+            border-radius: 18px 18px 0 0; padding: 0.85rem 0.85rem 1rem;
+            box-shadow: 0 -18px 40px rgba(0,0,0,0.28);
+            animation: birth-sheet-up 0.28s cubic-bezier(.2,.85,.25,1) both;
+        }
+        .birth-picker-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 0.75rem; }
+        .birth-picker-title { color: var(--gold-bright); font-size: 1rem; letter-spacing: 0.08em; }
+        .birth-picker-btn {
+            min-width: 56px; min-height: 44px; border: 0; border-radius: 999px;
+            background: transparent; color: var(--text-dim); font-family: inherit; font-size: 0.9rem;
+            cursor: pointer; touch-action: manipulation;
+        }
+        .birth-picker-btn.confirm { color: var(--button-text); background: linear-gradient(135deg, var(--gold-dim), var(--gold)); font-weight: 700; }
+        .birth-picker-btn:focus-visible { outline: 2px solid var(--gold-bright); outline-offset: 2px; }
+        .birth-picker-grid { display: grid; grid-template-columns: 1.35fr repeat(4, 1fr); gap: 0.35rem; }
+        .birth-wheel-wrap { position: relative; min-width: 0; }
+        .birth-wheel-label { text-align: center; color: var(--text-dim); font-size: 0.72rem; margin-bottom: 0.25rem; }
+        .birth-wheel-wrap::after {
+            content: ''; pointer-events: none; position: absolute; left: 0; right: 0; top: 96px; height: 38px;
+            border-top: 1px solid var(--gold-border); border-bottom: 1px solid var(--gold-border);
+            background: var(--gold-tint); border-radius: 8px;
+        }
+        .birth-wheel {
+            height: 188px; overflow-y: auto; scroll-snap-type: y mandatory; padding: 72px 0;
+            scrollbar-width: none; -webkit-overflow-scrolling: touch;
+            mask-image: linear-gradient(to bottom, transparent, #000 18%, #000 82%, transparent);
+        }
+        .birth-wheel::-webkit-scrollbar { display: none; }
+        .birth-wheel-item {
+            height: 38px; width: 100%; border: 0; background: transparent; color: var(--text-dim);
+            display: flex; align-items: center; justify-content: center; font-family: inherit;
+            font-size: 0.95rem; scroll-snap-align: center; cursor: pointer; position: relative; z-index: 1;
+            transition: color 0.18s ease, transform 0.18s ease;
+        }
+        .birth-wheel-item.is-selected { color: var(--gold-bright); font-weight: 700; transform: scale(1.06); }
+        @keyframes birth-sheet-up { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
         .btn-divine {
             display: block; width: 100%; padding: 0.8rem; margin-top: 0.75rem;
             background: linear-gradient(135deg, var(--gold-dim), var(--gold));
@@ -961,10 +1018,16 @@ INDEX_HTML = r'''
             .divine-progress { width: 180px; }
             .divine-ring { width: 160px; height: 160px; margin-top: -80px; margin-left: -80px; }
             .divine-ring:nth-child(2) { width: 220px; height: 220px; margin-top: -110px; margin-left: -110px; }
+            .birth-picker-sheet { max-width: none; padding: 0.75rem 0.55rem calc(0.85rem + env(safe-area-inset-bottom, 0px)); }
+            .birth-picker-grid { grid-template-columns: 1.25fr repeat(4, minmax(0, 1fr)); gap: 0.18rem; }
+            .birth-wheel-label { font-size: 0.68rem; }
+            .birth-wheel-item { font-size: 0.88rem; }
+            .birth-picker-value { font-size: 0.95rem; }
         }
         @media (prefers-reduced-motion: reduce) {
             .ai-summary-card, .ai-progress-panel, .ai-step, .ai-progress-fill,
-            .ai-step[data-state="active"] .ai-step-dot, .ai-skeleton-line::after {
+            .ai-step[data-state="active"] .ai-step-dot, .ai-skeleton-line::after,
+            .birth-picker-trigger, .birth-picker-sheet, .birth-wheel-item {
                 animation: none; transition: none;
             }
         }
@@ -993,11 +1056,18 @@ INDEX_HTML = r'''
             <div class="card-title">输入生辰信息</div>
             <div class="form-grid">
                 <div class="form-group" style="grid-column: 1 / -1;"><label>姓名/备注（选填）</label><input type="text" id="name" placeholder="如：张三"></div>
-                <div class="form-group"><label>公历年份</label><input type="tel" id="year" placeholder="如：1990" inputmode="numeric" pattern="[0-9]*"></div>
-                <div class="form-group"><label>月份</label><input type="tel" id="month" placeholder="1-12" inputmode="numeric" pattern="[0-9]*"></div>
-                <div class="form-group"><label>日期</label><input type="tel" id="day" placeholder="1-31" inputmode="numeric" pattern="[0-9]*"></div>
-                <div class="form-group"><label>时(24小时制)</label><input type="tel" id="hour" placeholder="0-23" inputmode="numeric" pattern="[0-9]*"></div>
-                <div class="form-group"><label>分钟</label><input type="tel" id="minute" placeholder="0-59" inputmode="numeric" pattern="[0-9]*"></div>
+                <div class="form-group" style="grid-column: 1 / -1;">
+                    <label>出生时间</label>
+                    <button class="birth-picker-trigger is-empty" id="birthPickerTrigger" type="button" onclick="openBirthPicker()" aria-haspopup="dialog" aria-label="选择出生年月日时分">
+                        <span class="birth-picker-value" id="birthPickerText">请选择出生时间</span>
+                        <span class="birth-picker-hint">滚动选择</span>
+                    </button>
+                    <input type="hidden" id="year">
+                    <input type="hidden" id="month">
+                    <input type="hidden" id="day">
+                    <input type="hidden" id="hour">
+                    <input type="hidden" id="minute">
+                </div>
                 <div class="form-group" style="grid-column: 1 / -1;"><label>性别</label><select id="gender"><option value="male">男</option><option value="female">女</option></select></div>
             </div>
             <button class="btn-divine" id="divineBtn" onclick="divine()">排盘推演</button>
@@ -1126,6 +1196,18 @@ INDEX_HTML = r'''
             <button class="modal-btn auth-btn" id="authSubmitBtn" onclick="handleAuth()">登录</button>
             <span class="auth-switch" id="authSwitch" onclick="switchAuthMode()">没有账号？去注册</span>
             <span class="auth-switch" onclick="document.getElementById('authModal').classList.remove('active')" style="margin-top:0.8rem;">取消</span>
+        </div>
+    </div>
+
+    <!-- 出生时间滚轮选择 -->
+    <div class="birth-picker-overlay" id="birthPickerOverlay" role="dialog" aria-modal="true" aria-labelledby="birthPickerTitle" onclick="handleBirthPickerBackdrop(event)">
+        <div class="birth-picker-sheet">
+            <div class="birth-picker-toolbar">
+                <button class="birth-picker-btn" type="button" onclick="closeBirthPicker(false)">取消</button>
+                <div class="birth-picker-title" id="birthPickerTitle">选择出生时间</div>
+                <button class="birth-picker-btn confirm" type="button" onclick="closeBirthPicker(true)">完成</button>
+            </div>
+            <div class="birth-picker-grid" id="birthPickerWheels"></div>
         </div>
     </div>
 
@@ -1714,6 +1796,223 @@ INDEX_HTML = r'''
             } catch(err) {}
         }
 
+        const BIRTH_PICKER_FIELDS = [
+            {key:'year', label:'年', min:1900, max:2100},
+            {key:'month', label:'月', min:1, max:12},
+            {key:'day', label:'日', min:1, max:31},
+            {key:'hour', label:'时', min:0, max:23},
+            {key:'minute', label:'分', min:0, max:59},
+        ];
+        let birthPickerDraft = null;
+        let birthWheelTimers = {};
+        let birthWheelScrollLocks = {};
+
+        function hasBirthSelection() {
+            return BIRTH_PICKER_FIELDS.every(f => document.getElementById(f.key).value !== '');
+        }
+
+        function pad2(n) {
+            return String(n).padStart(2, '0');
+        }
+
+        function daysInMonth(year, month) {
+            return new Date(year, month, 0).getDate();
+        }
+
+        function clampNumber(value, min, max, fallback) {
+            const n = parseInt(value, 10);
+            if (isNaN(n)) return fallback;
+            return Math.max(min, Math.min(max, n));
+        }
+
+        function normalizeBirthState(state) {
+            const next = Object.assign({year:2000, month:1, day:1, hour:12, minute:0}, state || {});
+            next.year = clampNumber(next.year, 1900, 2100, 2000);
+            next.month = clampNumber(next.month, 1, 12, 1);
+            next.hour = clampNumber(next.hour, 0, 23, 12);
+            next.minute = clampNumber(next.minute, 0, 59, 0);
+            next.day = clampNumber(next.day, 1, daysInMonth(next.year, next.month), 1);
+            return next;
+        }
+
+        function readBirthFields() {
+            return normalizeBirthState({
+                year: document.getElementById('year').value,
+                month: document.getElementById('month').value,
+                day: document.getElementById('day').value,
+                hour: document.getElementById('hour').value,
+                minute: document.getElementById('minute').value,
+            });
+        }
+
+        function formatBirthState(state) {
+            return state.year + '年' + state.month + '月' + state.day + '日 ' + pad2(state.hour) + ':' + pad2(state.minute);
+        }
+
+        function setBirthPlaceholder() {
+            const trigger = document.getElementById('birthPickerTrigger');
+            document.getElementById('birthPickerText').textContent = '请选择出生时间';
+            trigger.classList.add('is-empty');
+            trigger.setAttribute('aria-label', '选择出生年月日时分');
+        }
+
+        function syncBirthFields(state) {
+            const next = normalizeBirthState(state);
+            const trigger = document.getElementById('birthPickerTrigger');
+            document.getElementById('year').value = next.year;
+            document.getElementById('month').value = next.month;
+            document.getElementById('day').value = next.day;
+            document.getElementById('hour').value = next.hour;
+            document.getElementById('minute').value = next.minute;
+            document.getElementById('birthPickerText').textContent = formatBirthState(next);
+            trigger.classList.remove('is-empty');
+            trigger.setAttribute('aria-label', '当前出生时间：' + formatBirthState(next) + '，轻触选择');
+        }
+
+        function getBirthFieldConfig(key) {
+            const config = BIRTH_PICKER_FIELDS.find(f => f.key === key);
+            if (!config) return null;
+            if (key === 'day') {
+                return Object.assign({}, config, {max: daysInMonth(birthPickerDraft.year, birthPickerDraft.month)});
+            }
+            return config;
+        }
+
+        function displayBirthValue(key, value) {
+            if (key === 'hour' || key === 'minute') return pad2(value);
+            return String(value);
+        }
+
+        function renderBirthWheel(key) {
+            const config = getBirthFieldConfig(key);
+            const wheel = document.getElementById('birthWheel_' + key);
+            if (!config || !wheel) return;
+            let html = '';
+            for (let value = config.min; value <= config.max; value++) {
+                const selected = value === birthPickerDraft[key] ? ' is-selected' : '';
+                const ariaSelected = selected ? 'true' : 'false';
+                html += '<button class="birth-wheel-item' + selected + '" type="button" role="option" aria-selected="' + ariaSelected + '" data-value="' + value + '" onclick="selectBirthValue(\'' + key + '\',' + value + ')">' + displayBirthValue(key, value) + '</button>';
+            }
+            wheel.innerHTML = html;
+            wheel.onscroll = function() { handleBirthWheelScroll(key); };
+        }
+
+        function renderBirthPickerWheels() {
+            const root = document.getElementById('birthPickerWheels');
+            root.innerHTML = BIRTH_PICKER_FIELDS.map(f =>
+                '<div class="birth-wheel-wrap">'
+                    + '<div class="birth-wheel-label">' + f.label + '</div>'
+                    + '<div class="birth-wheel" id="birthWheel_' + f.key + '" data-key="' + f.key + '" role="listbox" aria-label="' + f.label + '选择"></div>'
+                + '</div>'
+            ).join('');
+            BIRTH_PICKER_FIELDS.forEach(f => renderBirthWheel(f.key));
+            requestAnimationFrame(() => BIRTH_PICKER_FIELDS.forEach(f => scrollBirthWheelToSelected(f.key, false)));
+        }
+
+        function updateBirthWheelSelection(key) {
+            const wheel = document.getElementById('birthWheel_' + key);
+            if (!wheel) return;
+            wheel.querySelectorAll('.birth-wheel-item').forEach(item => {
+                const selected = parseInt(item.dataset.value, 10) === birthPickerDraft[key];
+                item.classList.toggle('is-selected', selected);
+                item.setAttribute('aria-selected', selected ? 'true' : 'false');
+            });
+        }
+
+        function shouldReduceMotion() {
+            return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        }
+
+        function scrollBirthWheelToSelected(key, smooth) {
+            const wheel = document.getElementById('birthWheel_' + key);
+            if (!wheel) return;
+            const selected = wheel.querySelector('.birth-wheel-item.is-selected');
+            if (!selected) return;
+            const top = selected.offsetTop - (wheel.clientHeight - selected.offsetHeight) / 2;
+            clearTimeout(birthWheelScrollLocks[key]);
+            birthWheelScrollLocks[key] = setTimeout(() => {
+                birthWheelScrollLocks[key] = null;
+            }, smooth && !shouldReduceMotion() ? 320 : 40);
+            wheel.scrollTo({top, behavior: smooth && !shouldReduceMotion() ? 'smooth' : 'auto'});
+        }
+
+        function selectBirthValue(key, value) {
+            birthPickerDraft[key] = parseInt(value, 10);
+            const beforeDay = birthPickerDraft.day;
+            birthPickerDraft = normalizeBirthState(birthPickerDraft);
+            updateBirthWheelSelection(key);
+            scrollBirthWheelToSelected(key, true);
+            if (key === 'year' || key === 'month') {
+                renderBirthWheel('day');
+                updateBirthWheelSelection('day');
+                scrollBirthWheelToSelected('day', beforeDay !== birthPickerDraft.day);
+            }
+        }
+
+        function handleBirthWheelScroll(key) {
+            if (birthWheelScrollLocks[key]) return;
+            clearTimeout(birthWheelTimers[key]);
+            birthWheelTimers[key] = setTimeout(() => {
+                if (birthWheelScrollLocks[key]) return;
+                const wheel = document.getElementById('birthWheel_' + key);
+                if (!wheel) return;
+                const center = wheel.scrollTop + wheel.clientHeight / 2;
+                let nearest = null;
+                let nearestDist = Infinity;
+                wheel.querySelectorAll('.birth-wheel-item').forEach(item => {
+                    const itemCenter = item.offsetTop + item.offsetHeight / 2;
+                    const dist = Math.abs(itemCenter - center);
+                    if (dist < nearestDist) {
+                        nearestDist = dist;
+                        nearest = item;
+                    }
+                });
+                if (!nearest) return;
+                const value = parseInt(nearest.dataset.value, 10);
+                if (value !== birthPickerDraft[key]) {
+                    selectBirthValue(key, value);
+                } else {
+                    scrollBirthWheelToSelected(key, true);
+                }
+            }, 90);
+        }
+
+        function openBirthPicker() {
+            birthPickerDraft = hasBirthSelection() ? readBirthFields() : normalizeBirthState();
+            renderBirthPickerWheels();
+            document.getElementById('birthPickerOverlay').classList.add('active');
+        }
+
+        function closeBirthPicker(apply) {
+            if (apply && birthPickerDraft) {
+                syncBirthFields(birthPickerDraft);
+            }
+            document.getElementById('birthPickerOverlay').classList.remove('active');
+            document.getElementById('birthPickerTrigger').focus({preventScroll: true});
+        }
+
+        function handleBirthPickerBackdrop(event) {
+            if (event.target && event.target.id === 'birthPickerOverlay') {
+                closeBirthPicker(false);
+            }
+        }
+
+        function initBirthPicker() {
+            if (hasBirthSelection()) {
+                syncBirthFields(readBirthFields());
+            } else {
+                setBirthPlaceholder();
+            }
+        }
+
+        document.addEventListener('keydown', function(event) {
+            const overlay = document.getElementById('birthPickerOverlay');
+            if (event.key === 'Escape' && overlay.classList.contains('active')) {
+                closeBirthPicker(false);
+            }
+        });
+
+        initBirthPicker();
         loadHistory();
 
         // === 演算动画 ===
@@ -1768,6 +2067,13 @@ INDEX_HTML = r'''
             const btn = document.getElementById('divineBtn');
             btn.disabled = true;
             btn.textContent = '排盘中...';
+
+            if (!hasBirthSelection()) {
+                alert('请先选择出生时间');
+                btn.disabled = false; btn.textContent = '排盘推演';
+                document.getElementById('birthPickerTrigger').focus();
+                return;
+            }
 
             const data = {
                 name: document.getElementById('name').value,
