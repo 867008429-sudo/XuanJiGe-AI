@@ -22,6 +22,27 @@ import os
 import json
 import time as _time
 
+def _load_env_fallback(path='.env'):
+    """Load simple KEY=VALUE pairs when python-dotenv is unavailable."""
+    if not os.path.exists(path):
+        return
+    with open(path, 'r', encoding='utf-8') as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    _load_env_fallback()
+
 import db
 import ai_service
 from bazi_engine import paipan
@@ -523,10 +544,109 @@ INDEX_HTML = r'''
             padding-bottom: env(safe-area-inset-bottom);
             -webkit-text-size-adjust: 100%;
             -webkit-tap-highlight-color: transparent;
+            position: relative;
             background-image:
                 radial-gradient(ellipse at 20% 0%, var(--body-glow-a) 0%, transparent 50%),
                 radial-gradient(ellipse at 80% 100%, var(--body-glow-b) 0%, transparent 50%);
             transition: background-color 0.25s ease, color 0.25s ease;
+        }
+        body::before, body::after {
+            content: ''; position: fixed; pointer-events: none; z-index: 0;
+        }
+        body::before {
+            inset: -22% -12%;
+            opacity: 0.5;
+            background:
+                repeating-radial-gradient(circle at 22% 22%, transparent 0 42px, var(--gold-tint) 43px 44px, transparent 45px 96px),
+                repeating-radial-gradient(circle at 78% 70%, transparent 0 54px, var(--red-tint) 55px 56px, transparent 57px 118px),
+                conic-gradient(from 22deg at 74% 24%, transparent 0 8deg, var(--gold-tint) 9deg 12deg, transparent 13deg 34deg, var(--gold-tint) 35deg 37deg, transparent 38deg 70deg);
+            mask-image: radial-gradient(ellipse at center, #000 0%, #000 62%, transparent 84%);
+            animation: dao-light-drift 34s ease-in-out infinite alternate;
+        }
+        body::after {
+            inset: 0;
+            opacity: 0.42;
+            background:
+                radial-gradient(circle at 24% 34%, transparent 0 74px, var(--gold-tint) 75px 77px, transparent 78px 118px, var(--gold-tint) 119px 120px, transparent 121px),
+                radial-gradient(circle at 76% 18%, transparent 0 52px, var(--gold-tint) 53px 55px, transparent 56px 92px, var(--red-tint) 93px 94px, transparent 95px),
+                radial-gradient(circle at 68% 78%, transparent 0 88px, var(--red-tint) 89px 91px, transparent 92px 138px, var(--gold-tint) 139px 140px, transparent 141px);
+            animation: ripple-field 18s ease-in-out infinite alternate;
+        }
+        html[data-theme="light"] body::before { opacity: 0.32; }
+        html[data-theme="light"] body::after { opacity: 0.3; }
+        @keyframes dao-light-drift {
+            from { transform: translate3d(-1.5%, -1%, 0) rotate(0deg) scale(1); }
+            to { transform: translate3d(1.5%, 1%, 0) rotate(4deg) scale(1.03); }
+        }
+        @keyframes ripple-field {
+            from { transform: translate3d(-0.8%, -0.8%, 0) scale(0.992); }
+            to { transform: translate3d(0.8%, 1.1%, 0) scale(1.018); }
+        }
+        .ambient-bg {
+            position: fixed; inset: 0; overflow: hidden; pointer-events: none; z-index: 0;
+            color: var(--gold); contain: strict;
+        }
+        .dao-sigil {
+            position: absolute; width: clamp(190px, 28vw, 340px); aspect-ratio: 1;
+            border-radius: 50%; opacity: 0.2; color: var(--gold-bright);
+            border: 1px solid var(--gold-border);
+            background:
+                radial-gradient(circle, transparent 0 26%, var(--gold-tint) 27% 28%, transparent 29% 45%, var(--gold-tint) 46% 47%, transparent 48%),
+                repeating-conic-gradient(from -4deg, transparent 0 17deg, var(--gold-tint-strong) 18deg 20deg, transparent 21deg 45deg);
+            box-shadow: inset 0 0 38px var(--gold-tint), 0 0 30px rgba(201,168,76,0.08);
+            animation: sigil-breathe 12s ease-in-out infinite;
+        }
+        .dao-sigil::before, .dao-sigil::after {
+            content: ''; position: absolute; inset: 16%; border-radius: 50%;
+            border: 1px solid var(--gold-border);
+        }
+        .dao-sigil::after { inset: 34%; opacity: 0.7; }
+        .dao-sigil-a { --sigil-rotate: -10deg; left: -76px; top: 96px; transform: rotate(var(--sigil-rotate)); }
+        .dao-sigil-b { --sigil-rotate: 18deg; right: -92px; bottom: 42px; transform: rotate(var(--sigil-rotate)); animation-delay: -5s; }
+        .dao-trigram {
+            position: absolute;
+            font-size: clamp(0.78rem, 1.6vw, 1.05rem); font-weight: 700;
+            letter-spacing: 0; text-shadow: 0 0 12px var(--gold-shadow);
+        }
+        .dao-trigram:nth-child(1) { left: 50%; top: 8%; transform: translate(-50%, -50%); }
+        .dao-trigram:nth-child(2) { right: 17%; top: 17%; transform: translate(50%, -50%); }
+        .dao-trigram:nth-child(3) { right: 8%; top: 50%; transform: translate(50%, -50%); }
+        .dao-trigram:nth-child(4) { right: 17%; bottom: 17%; transform: translate(50%, 50%); }
+        .dao-trigram:nth-child(5) { left: 50%; bottom: 8%; transform: translate(-50%, 50%); }
+        .dao-trigram:nth-child(6) { left: 17%; bottom: 17%; transform: translate(-50%, 50%); }
+        .dao-trigram:nth-child(7) { left: 8%; top: 50%; transform: translate(-50%, -50%); }
+        .dao-trigram:nth-child(8) { left: 17%; top: 17%; transform: translate(-50%, -50%); }
+        .scripture-flow {
+            position: absolute; max-width: 16rem;
+            font-size: clamp(0.72rem, 1.1vw, 0.98rem); line-height: 1.9;
+            letter-spacing: 0.16em; color: var(--gold-bright);
+            opacity: 0.13; text-shadow: 0 0 14px var(--gold-shadow);
+            filter: blur(0.05px); animation: scripture-ripple 9s ease-in-out infinite;
+        }
+        .scripture-flow::after {
+            content: ''; position: absolute; left: 50%; top: 50%; width: 140%; aspect-ratio: 1;
+            border-radius: 50%; border: 1px solid currentColor; opacity: 0.18;
+            transform: translate(-50%, -50%) scale(0.72);
+            animation: scripture-ring 5.8s ease-out infinite;
+        }
+        .scripture-a { left: 7vw; top: 18vh; animation-delay: -1s; }
+        .scripture-b { right: 8vw; top: 15vh; max-width: 13rem; animation-delay: -4s; }
+        .scripture-c { left: 10vw; bottom: 13vh; max-width: 14rem; animation-delay: -6s; }
+        .scripture-d { right: 16vw; bottom: 22vh; max-width: 15rem; animation-delay: -2.5s; }
+        .scripture-e { left: 42vw; top: 8vh; max-width: 12rem; animation-delay: -7.2s; }
+        .scripture-f { left: 52vw; bottom: 8vh; max-width: 13rem; animation-delay: -3.4s; }
+        @keyframes sigil-breathe {
+            0%, 100% { opacity: 0.16; transform: translate3d(0,0,0) rotate(var(--sigil-rotate, 0deg)) scale(0.98); }
+            50% { opacity: 0.27; transform: translate3d(0,-6px,0) rotate(var(--sigil-rotate, 0deg)) scale(1.03); }
+        }
+        @keyframes scripture-ripple {
+            0%, 100% { opacity: 0.08; transform: translate3d(0, 0, 0) scale(0.985); }
+            45% { opacity: 0.18; transform: translate3d(10px, -8px, 0) scale(1.018); }
+            70% { opacity: 0.11; transform: translate3d(-7px, 6px, 0) scale(1.002); }
+        }
+        @keyframes scripture-ring {
+            0% { opacity: 0.18; transform: translate(-50%, -50%) scale(0.62); }
+            100% { opacity: 0; transform: translate(-50%, -50%) scale(1.25); }
         }
         .header {
             border-bottom: 1px solid var(--border); padding: 0.5rem 0.75rem;
@@ -585,7 +705,7 @@ INDEX_HTML = r'''
             display: inline-flex; align-items: center; justify-content: center;
             font-size: 0.7rem; color: var(--gold); white-space: nowrap; cursor: pointer;
         }
-        .container { max-width: 900px; margin: 0 auto; padding: 0.75rem; padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px)); }
+        .container { max-width: 900px; margin: 0 auto; padding: 0.75rem; padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px)); position: relative; z-index: 1; }
 
         /* 输入卡片 */
         .input-card {
@@ -624,15 +744,19 @@ INDEX_HTML = r'''
         .birth-picker-hint { color: var(--text-dim); font-size: 0.75rem; white-space: nowrap; }
         .birth-picker-overlay {
             display: none; position: fixed; inset: 0; z-index: 260; background: var(--modal-scrim);
-            align-items: flex-end; justify-content: center; padding: 0 0 env(safe-area-inset-bottom, 0px);
+            align-items: flex-start; justify-content: center;
+            padding: clamp(4.5rem, 12vh, 7.5rem) 1rem 1rem;
+            backdrop-filter: blur(8px);
         }
         .birth-picker-overlay.active { display: flex; }
         .birth-picker-sheet {
             width: 100%; max-width: 560px; background: var(--bg-card);
-            border: 1px solid var(--border); border-bottom: 0;
-            border-radius: 18px 18px 0 0; padding: 0.85rem 0.85rem 1rem;
-            box-shadow: 0 -18px 40px rgba(0,0,0,0.28);
-            animation: birth-sheet-up 0.28s cubic-bezier(.2,.85,.25,1) both;
+            border: 1px solid var(--border);
+            border-radius: 18px; padding: 0.85rem 0.85rem 1rem;
+            box-shadow: 0 24px 70px rgba(0,0,0,0.32), 0 0 0 1px var(--gold-tint);
+            animation: birth-sheet-in 0.3s cubic-bezier(.2,.85,.25,1) both;
+            max-height: min(82dvh, 460px);
+            overflow: hidden;
         }
         .birth-picker-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 0.75rem; }
         .birth-picker-title { color: var(--gold-bright); font-size: 1rem; letter-spacing: 0.08em; }
@@ -655,7 +779,9 @@ INDEX_HTML = r'''
             height: 188px; overflow-y: auto; scroll-snap-type: y mandatory; padding: 72px 0;
             scrollbar-width: none; -webkit-overflow-scrolling: touch;
             mask-image: linear-gradient(to bottom, transparent, #000 18%, #000 82%, transparent);
+            cursor: grab; user-select: none; overscroll-behavior: contain;
         }
+        .birth-wheel.is-dragging { cursor: grabbing; scroll-snap-type: none; }
         .birth-wheel::-webkit-scrollbar { display: none; }
         .birth-wheel-item {
             height: 38px; width: 100%; border: 0; background: transparent; color: var(--text-dim);
@@ -664,7 +790,7 @@ INDEX_HTML = r'''
             transition: color 0.18s ease, transform 0.18s ease;
         }
         .birth-wheel-item.is-selected { color: var(--gold-bright); font-weight: 700; transform: scale(1.06); }
-        @keyframes birth-sheet-up { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes birth-sheet-in { from { opacity: 0; transform: translateY(-8px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
         .btn-divine {
             display: block; width: 100%; padding: 0.8rem; margin-top: 0.75rem;
             background: linear-gradient(135deg, var(--gold-dim), var(--gold));
@@ -860,20 +986,37 @@ INDEX_HTML = r'''
 
         /* 付费弹窗 */
         .modal-overlay {
-            display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            display: flex; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: var(--modal-scrim); z-index: 200;
             justify-content: center; align-items: center;
+            opacity: 0; visibility: hidden; pointer-events: none;
+            transition: opacity 0.22s ease, visibility 0s linear 0.22s;
+            will-change: opacity;
+            padding: 1rem;
         }
-        .modal-overlay.active { display: flex; }
+        .modal-overlay.active { opacity: 1; visibility: visible; pointer-events: auto; transition-delay: 0s; }
         .modal {
             background: var(--bg-card); border: 1px solid var(--gold);
             border-radius: 12px; padding: 2rem; max-width: 400px; text-align: center;
+            opacity: 0; transform: translateY(18px) scale(0.965);
+            transition: opacity 0.24s ease, transform 0.34s cubic-bezier(.2,.9,.2,1);
+            will-change: opacity, transform;
+            box-shadow: 0 24px 70px rgba(0,0,0,0.28);
         }
+        .modal-overlay.active .modal { opacity: 1; transform: translateY(0) scale(1); }
         .modal-title { color: var(--gold); font-size: 1.2rem; margin-bottom: 1rem; }
         .modal-text { color: var(--text); margin-bottom: 1.5rem; line-height: 1.6; }
         .modal-btn { background: linear-gradient(135deg, var(--gold-dim), var(--gold)); border: none; border-radius: 8px; padding: 0.8rem 2rem; color: var(--button-text); font-family: inherit; font-weight: 700; cursor: pointer; }
 
         /* 登录注册弹窗 */
+        .auth-overlay { z-index: 220; }
+        .auth-modal-card { width: min(400px, 100%); overflow: hidden; }
+        .auth-flow {
+            transform: translateX(0); opacity: 1;
+            transition: opacity 0.18s ease, transform 0.22s cubic-bezier(.2,.85,.25,1);
+        }
+        .auth-flow.is-leaving { opacity: 0; transform: translateX(var(--auth-slide-out, -10px)); }
+        .auth-flow.is-entering { opacity: 0; transform: translateX(var(--auth-slide-in, 10px)); }
         .auth-input {
             background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px;
             padding: 0.7rem; color: var(--text); font-family: inherit; font-size: 1rem;
@@ -1018,22 +1161,60 @@ INDEX_HTML = r'''
             .divine-progress { width: 180px; }
             .divine-ring { width: 160px; height: 160px; margin-top: -80px; margin-left: -80px; }
             .divine-ring:nth-child(2) { width: 220px; height: 220px; margin-top: -110px; margin-left: -110px; }
-            .birth-picker-sheet { max-width: none; padding: 0.75rem 0.55rem calc(0.85rem + env(safe-area-inset-bottom, 0px)); }
+            .birth-picker-overlay { align-items: flex-end; padding: 0 0 env(safe-area-inset-bottom, 0px); }
+            .birth-picker-sheet {
+                max-width: none; max-height: 64dvh;
+                border-radius: 18px 18px 0 0; border-bottom: 0;
+                padding: 0.75rem 0.55rem calc(0.85rem + env(safe-area-inset-bottom, 0px));
+                animation-name: birth-sheet-up;
+            }
             .birth-picker-grid { grid-template-columns: 1.25fr repeat(4, minmax(0, 1fr)); gap: 0.18rem; }
             .birth-wheel-label { font-size: 0.68rem; }
             .birth-wheel-item { font-size: 0.88rem; }
             .birth-picker-value { font-size: 0.95rem; }
+            .dao-sigil { width: 210px; opacity: 0.16; }
+            .dao-sigil-a { left: -112px; top: 118px; }
+            .dao-sigil-b { right: -120px; bottom: 40px; }
+            .scripture-flow { font-size: 0.68rem; max-width: 9.5rem; opacity: 0.1; letter-spacing: 0.1em; }
+            .scripture-b, .scripture-e { display: none; }
+            .auth-overlay { align-items: flex-end; padding: 0; }
+            .auth-modal-card {
+                width: 100%; max-width: none; border-radius: 18px 18px 0 0; border-bottom: 0;
+                padding: 1.4rem 1.1rem calc(1.2rem + env(safe-area-inset-bottom, 0px));
+                transform: translateY(28px) scale(1);
+            }
+            .auth-overlay.active .auth-modal-card { transform: translateY(0) scale(1); }
         }
+        @keyframes birth-sheet-up { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
         @media (prefers-reduced-motion: reduce) {
             .ai-summary-card, .ai-progress-panel, .ai-step, .ai-progress-fill,
             .ai-step[data-state="active"] .ai-step-dot, .ai-skeleton-line::after,
-            .birth-picker-trigger, .birth-picker-sheet, .birth-wheel-item {
+            .birth-picker-trigger, .birth-picker-sheet, .birth-wheel-item,
+            .modal-overlay, .modal, .auth-flow,
+            body::before, body::after,
+            .ambient-bg, .ambient-bg * {
                 animation: none; transition: none;
             }
         }
     </style>
 </head>
 <body>
+    <div class="ambient-bg" aria-hidden="true">
+        <div class="dao-sigil dao-sigil-a">
+            <span class="dao-trigram">乾</span><span class="dao-trigram">兑</span><span class="dao-trigram">离</span><span class="dao-trigram">震</span>
+            <span class="dao-trigram">巽</span><span class="dao-trigram">坎</span><span class="dao-trigram">艮</span><span class="dao-trigram">坤</span>
+        </div>
+        <div class="dao-sigil dao-sigil-b">
+            <span class="dao-trigram">乾</span><span class="dao-trigram">兑</span><span class="dao-trigram">离</span><span class="dao-trigram">震</span>
+            <span class="dao-trigram">巽</span><span class="dao-trigram">坎</span><span class="dao-trigram">艮</span><span class="dao-trigram">坤</span>
+        </div>
+        <div class="scripture-flow scripture-a">道可道，非常道。名可名，非常名。</div>
+        <div class="scripture-flow scripture-b">天地定位，山泽通气，雷风相薄。</div>
+        <div class="scripture-flow scripture-c">甲乙丙丁戊己庚辛，壬癸循环。</div>
+        <div class="scripture-flow scripture-d">乾坤坎离，震巽艮兑，阴阳消息。</div>
+        <div class="scripture-flow scripture-e">一阴一阳之谓道，顺逆之间见机。</div>
+        <div class="scripture-flow scripture-f">子丑寅卯，辰巳午未，申酉戌亥。</div>
+    </div>
     <div class="header">
         <div class="logo">
             <div class="logo-taiji"></div>
@@ -1060,7 +1241,7 @@ INDEX_HTML = r'''
                     <label>出生时间</label>
                     <button class="birth-picker-trigger is-empty" id="birthPickerTrigger" type="button" onclick="openBirthPicker()" aria-haspopup="dialog" aria-label="选择出生年月日时分">
                         <span class="birth-picker-value" id="birthPickerText">请选择出生时间</span>
-                        <span class="birth-picker-hint">滚动选择</span>
+                        <span class="birth-picker-hint">滚动/拖动</span>
                     </button>
                     <input type="hidden" id="year">
                     <input type="hidden" id="month">
@@ -1187,15 +1368,17 @@ INDEX_HTML = r'''
     </div>
 
     <!-- 登录注册弹窗 -->
-    <div class="modal-overlay" id="authModal">
-        <div class="modal">
+    <div class="modal-overlay auth-overlay" id="authModal" role="dialog" aria-modal="true" aria-labelledby="authTitle" onclick="handleAuthBackdrop(event)">
+        <div class="modal auth-modal-card" onclick="event.stopPropagation()">
+            <div class="auth-flow" id="authFlow">
             <div class="modal-title" id="authTitle">登录</div>
             <input type="text" class="auth-input" id="authUsername" placeholder="用户名（2-20字符）" maxlength="20">
             <input type="password" class="auth-input" id="authPassword" placeholder="密码（至少4位）" style="-webkit-text-security:disc;">
             <div class="auth-error" id="authError"></div>
             <button class="modal-btn auth-btn" id="authSubmitBtn" onclick="handleAuth()">登录</button>
             <span class="auth-switch" id="authSwitch" onclick="switchAuthMode()">没有账号？去注册</span>
-            <span class="auth-switch" onclick="document.getElementById('authModal').classList.remove('active')" style="margin-top:0.8rem;">取消</span>
+            <span class="auth-switch" onclick="closeAuthModal()" style="margin-top:0.8rem;">取消</span>
+            </div>
         </div>
     </div>
 
@@ -1481,20 +1664,57 @@ INDEX_HTML = r'''
 
         // === 账号登录注册 ===
         let authMode = 'login'; // 'login' or 'register'
+        let authSwitchTimer = null;
 
         function showAuthModal(mode) {
+            clearTimeout(authSwitchTimer);
             authMode = mode || 'login';
             document.getElementById('authError').textContent = '';
             document.getElementById('authUsername').value = '';
             document.getElementById('authPassword').value = '';
+            document.getElementById('authFlow').classList.remove('is-leaving', 'is-entering');
             updateAuthUI();
             document.getElementById('authModal').classList.add('active');
+            requestAnimationFrame(() => {
+                document.getElementById('authUsername').focus({preventScroll: true});
+            });
+        }
+
+        function closeAuthModal() {
+            document.getElementById('authModal').classList.remove('active');
+        }
+
+        function handleAuthBackdrop(event) {
+            if (event.target && event.target.id === 'authModal') {
+                closeAuthModal();
+            }
         }
 
         function switchAuthMode() {
-            authMode = authMode === 'login' ? 'register' : 'login';
+            const nextMode = authMode === 'login' ? 'register' : 'login';
+            const flow = document.getElementById('authFlow');
+            clearTimeout(authSwitchTimer);
             document.getElementById('authError').textContent = '';
-            updateAuthUI();
+            if (!flow || shouldReduceMotion()) {
+                authMode = nextMode;
+                updateAuthUI();
+                return;
+            }
+            const direction = nextMode === 'register' ? 1 : -1;
+            flow.style.setProperty('--auth-slide-out', (direction * -12) + 'px');
+            flow.style.setProperty('--auth-slide-in', (direction * 12) + 'px');
+            flow.classList.remove('is-entering');
+            flow.classList.add('is-leaving');
+            authSwitchTimer = setTimeout(() => {
+                authMode = nextMode;
+                updateAuthUI();
+                flow.classList.remove('is-leaving');
+                flow.classList.add('is-entering');
+                requestAnimationFrame(() => {
+                    flow.classList.remove('is-entering');
+                    document.getElementById('authUsername').focus({preventScroll: true});
+                });
+            }, 150);
         }
 
         function updateAuthUI() {
@@ -1533,7 +1753,7 @@ INDEX_HTML = r'''
                 // 成功
                 localStorage.setItem('xjg_auth_token', data.token);
                 localStorage.setItem('xjg_username', data.username);
-                document.getElementById('authModal').classList.remove('active');
+                closeAuthModal();
                 updateQuota();
                 loadHistory();  // 换了账号身份，历史记录也要切换
                 btn.textContent = oldText;
@@ -1728,6 +1948,10 @@ INDEX_HTML = r'''
                         if (!line.startsWith('data: ')) continue;
                         try {
                             const chunk = JSON.parse(line.slice(6));
+                            if (chunk.status) {
+                                clearAIWaitTimer();
+                                setAIStatus(chunk.status, typeof chunk.progress === 'number' ? chunk.progress : 12);
+                            }
                             if (chunk.text) {
                                 clearAIWaitTimer();
                                 fullText += chunk.text;
@@ -1806,6 +2030,7 @@ INDEX_HTML = r'''
         let birthPickerDraft = null;
         let birthWheelTimers = {};
         let birthWheelScrollLocks = {};
+        let birthWheelDragState = null;
 
         function hasBirthSelection() {
             return BIRTH_PICKER_FIELDS.every(f => document.getElementById(f.key).value !== '');
@@ -1895,6 +2120,54 @@ INDEX_HTML = r'''
             }
             wheel.innerHTML = html;
             wheel.onscroll = function() { handleBirthWheelScroll(key); };
+            attachBirthWheelDrag(wheel, key);
+        }
+
+        function attachBirthWheelDrag(wheel, key) {
+            if (!wheel || wheel.dataset.dragReady === '1') return;
+            wheel.dataset.dragReady = '1';
+            wheel.addEventListener('pointerdown', function(event) {
+                if (event.button !== 0 || event.pointerType === 'touch') return;
+                birthWheelDragState = {
+                    key: key,
+                    wheel: wheel,
+                    startY: event.clientY,
+                    startScrollTop: wheel.scrollTop,
+                    moved: false,
+                };
+                wheel.classList.add('is-dragging');
+                wheel.setPointerCapture(event.pointerId);
+            });
+            wheel.addEventListener('pointermove', function(event) {
+                if (!birthWheelDragState || birthWheelDragState.wheel !== wheel) return;
+                const deltaY = event.clientY - birthWheelDragState.startY;
+                if (Math.abs(deltaY) > 3) birthWheelDragState.moved = true;
+                wheel.scrollTop = birthWheelDragState.startScrollTop - deltaY;
+                if (birthWheelDragState.moved) event.preventDefault();
+            });
+            function finishDrag(event) {
+                if (!birthWheelDragState || birthWheelDragState.wheel !== wheel) return;
+                const moved = birthWheelDragState.moved;
+                birthWheelDragState = null;
+                wheel.classList.remove('is-dragging');
+                if (event && wheel.hasPointerCapture && wheel.hasPointerCapture(event.pointerId)) {
+                    wheel.releasePointerCapture(event.pointerId);
+                }
+                if (moved) {
+                    wheel.dataset.dragged = '1';
+                    handleBirthWheelScroll(key);
+                    setTimeout(() => { wheel.dataset.dragged = '0'; }, 0);
+                }
+            }
+            wheel.addEventListener('pointerup', finishDrag);
+            wheel.addEventListener('pointercancel', finishDrag);
+            wheel.addEventListener('lostpointercapture', finishDrag);
+            wheel.addEventListener('click', function(event) {
+                if (wheel.dataset.dragged === '1') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                }
+            }, true);
         }
 
         function renderBirthPickerWheels() {
@@ -1952,9 +2225,11 @@ INDEX_HTML = r'''
 
         function handleBirthWheelScroll(key) {
             if (birthWheelScrollLocks[key]) return;
+            if (birthWheelDragState && birthWheelDragState.key === key) return;
             clearTimeout(birthWheelTimers[key]);
             birthWheelTimers[key] = setTimeout(() => {
                 if (birthWheelScrollLocks[key]) return;
+                if (birthWheelDragState && birthWheelDragState.key === key) return;
                 const wheel = document.getElementById('birthWheel_' + key);
                 if (!wheel) return;
                 const center = wheel.scrollTop + wheel.clientHeight / 2;
@@ -2007,6 +2282,11 @@ INDEX_HTML = r'''
         }
 
         document.addEventListener('keydown', function(event) {
+            const authOverlay = document.getElementById('authModal');
+            if (event.key === 'Escape' && authOverlay.classList.contains('active')) {
+                closeAuthModal();
+                return;
+            }
             const overlay = document.getElementById('birthPickerOverlay');
             if (event.key === 'Escape' && overlay.classList.contains('active')) {
                 closeBirthPicker(false);

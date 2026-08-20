@@ -27,7 +27,10 @@ MAX_TOKENS = int(os.environ.get('DEEPSEEK_MAX_TOKENS', '6000'))  # 限制输出�
 TEMPERATURE = float(os.environ.get('DEEPSEEK_TEMPERATURE', '0.7'))
 THINKING_ENABLED = os.environ.get('DEEPSEEK_THINKING', '0').lower() not in ('0', 'false', 'off', 'no')
 REASONING_EFFORT = os.environ.get('DEEPSEEK_REASONING_EFFORT', 'high')
-PROMPT_VERSION = 'interpretation-v4-flash'
+STRUCTURED_GENERATION_ENABLED = os.environ.get('DEEPSEEK_STRUCTURED_GENERATION', '1').lower() not in ('0', 'false', 'off', 'no')
+STRUCTURE_MAX_TOKENS = int(os.environ.get('DEEPSEEK_STRUCTURE_MAX_TOKENS', '3200'))
+STRUCTURE_TEMPERATURE = float(os.environ.get('DEEPSEEK_STRUCTURE_TEMPERATURE', '0.25'))
+PROMPT_VERSION = 'interpretation-v5-structured'
 
 # Token价格（美元）。不同模型/时段价格会变，生产可用环境变量覆盖。
 INPUT_PRICE_PER_M = float(os.environ.get('DEEPSEEK_INPUT_PRICE_PER_M_USD', '0.56'))
@@ -57,7 +60,8 @@ def build_cache_key(paipan_data):
     prompt或模型策略升级后自动避开旧的低质量解读缓存。
     """
     thinking_flag = 'thinking' if THINKING_ENABLED else 'direct'
-    key_raw = f"{PROMPT_VERSION}_{DEEPSEEK_MODEL}_{thinking_flag}_{_cache_identity(paipan_data)}"
+    structure_flag = 'structured' if STRUCTURED_GENERATION_ENABLED else 'direct'
+    key_raw = f"{PROMPT_VERSION}_{DEEPSEEK_MODEL}_{thinking_flag}_{structure_flag}_{_cache_identity(paipan_data)}"
     return hashlib.md5(key_raw.encode()).hexdigest()
 
 
@@ -99,7 +103,7 @@ def _wuxing_line(paipan_data):
     )
 
 
-def build_prompt(paipan_data):
+def build_prompt(paipan_data, analysis_outline=None):
     """
     构造发给DeepSeek的prompt
     设计思路:
@@ -184,6 +188,18 @@ def build_prompt(paipan_data):
 【健康】结合五行偏枯和火土金木水强弱，只给养生级建议，不做疾病诊断。
 【大运】先讲当前大运，再讲未来2-3步趋势；每一步都要说明干支十神与喜忌的关系。
 【总评】提炼命格主线、成事方式、最该修的短板和一句道长赠言。"""
+    if analysis_outline:
+        outline_json = json.dumps(analysis_outline, ensure_ascii=False)
+        system += (
+            '\n\n本次采用两段式生成。你将收到一份结构化分析骨架，'
+            '最终正文必须围绕骨架中的 section、evidence、claim、advice 扩写，'
+            '不得新增与骨架相反的判断，也不要把 JSON 或字段名展示给用户。'
+        )
+        user += (
+            '\n\n结构化分析骨架（只供你扩写正文，不要原样输出）：\n'
+            f'{outline_json}'
+        )
+
     return system, user
 
 
@@ -208,6 +224,128 @@ def build_payload(system_prompt, user_prompt):
         payload['thinking'] = {'type': 'disabled'}
         payload['temperature'] = TEMPERATURE
     return payload
+
+
+def build_structured_prompt(paipan_data):
+    """Build the first-stage JSON outline prompt."""
+    _, paipan_context = build_prompt(paipan_data)
+    example = {
+        "summary": "一句话提炼命盘主线",
+        "sections": [
+            {
+                "name": "性格",
+                "claim": "本板块核心判断",
+                "evidence": ["盘面证据1", "盘面证据2"],
+                "real_world_mapping": ["现实表现1", "现实表现2"],
+                "advice": ["可执行建议1", "可执行建议2"],
+                "classic_hint": {"book": "滴天髓", "meaning": "短句义理"}
+            }
+        ],
+        "current_dayun": {"label": "当前大运", "focus": "这一运的主线"},
+        "risk_notes": ["避免绝对化和医疗化表达"]
+    }
+    system = (
+        '你是玄机阁的命理分析规划器。你的任务不是写最终正文，而是先把命盘拆成可验证的 JSON 分析骨架。'
+        '必须只输出一个合法 JSON object，不要 Markdown，不要解释，不要代码块。'
+        '每个判断都要绑定至少两条盘面证据，证据必须来自用户给定命盘，不得重新排盘。'
+    )
+    user = (
+        paipan_context
+        + '\n\n本阶段只输出 JSON 骨架。必须包含 summary、sections、current_dayun、risk_notes。'
+        + 'sections 必须严格按 性格、财运、婚姻、健康、大运、总评 六项输出。'
+        + '每个 section 必须包含 name、claim、evidence、real_world_mapping、advice、classic_hint。'
+        + 'evidence 至少2条，real_world_mapping 至少2条，advice 至少2条。'
+        + '健康只给养生建议；财运不作投资保证；婚姻不作绝对断语。'
+        + '\n\nJSON 示例结构：\n'
+        + json.dumps(example, ensure_ascii=False)
+    )
+    return system, user
+
+
+def build_structured_payload(system_prompt, user_prompt):
+    return {
+        'model': DEEPSEEK_MODEL,
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt}
+        ],
+        'max_tokens': STRUCTURE_MAX_TOKENS,
+        'stream': False,
+        'response_format': {'type': 'json_object'},
+        'thinking': {'type': 'disabled'},
+        'temperature': STRUCTURE_TEMPERATURE,
+    }
+
+
+def _extract_json_object(content):
+    content = (content or '').strip()
+    if content.startswith('```'):
+        content = re.sub(r'^```(?:json)?\s*', '', content)
+        content = re.sub(r'\s*```$', '', content)
+    return json.loads(content)
+
+
+def validate_structured_outline(outline):
+    issues = []
+    if not isinstance(outline, dict):
+        return ['结构化骨架不是 JSON object']
+
+    sections = outline.get('sections')
+    if not isinstance(sections, list):
+        return ['结构化骨架缺少 sections 数组']
+
+    names = [section.get('name') for section in sections if isinstance(section, dict)]
+    if names[:len(SECTION_NAMES)] != SECTION_NAMES:
+        issues.append('结构化骨架板块顺序不正确')
+    if len(sections) != len(SECTION_NAMES):
+        issues.append('结构化骨架板块数量不正确')
+
+    for expected_name, section in zip(SECTION_NAMES, sections):
+        if not isinstance(section, dict):
+            issues.append(f'{expected_name}板块不是对象')
+            continue
+        evidence = section.get('evidence') or []
+        mapping = section.get('real_world_mapping') or []
+        advice = section.get('advice') or []
+        if section.get('name') != expected_name:
+            issues.append(f'{expected_name}板块名称不匹配')
+        if not section.get('claim'):
+            issues.append(f'{expected_name}缺少核心判断')
+        if not isinstance(evidence, list) or len([x for x in evidence if str(x).strip()]) < 2:
+            issues.append(f'{expected_name}证据不足')
+        if not isinstance(mapping, list) or len([x for x in mapping if str(x).strip()]) < 2:
+            issues.append(f'{expected_name}现实映射不足')
+        if not isinstance(advice, list) or len([x for x in advice if str(x).strip()]) < 2:
+            issues.append(f'{expected_name}建议不足')
+
+    return issues
+
+
+def request_structured_outline(paipan_data, headers):
+    system_prompt, user_prompt = build_structured_prompt(paipan_data)
+    payload = build_structured_payload(system_prompt, user_prompt)
+    resp = requests.post(
+        DEEPSEEK_API_URL,
+        json=payload,
+        headers=headers,
+        timeout=45
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choice = (data.get('choices') or [{}])[0]
+    message = choice.get('message') or {}
+    outline = _extract_json_object(message.get('content', ''))
+    issues = validate_structured_outline(outline)
+    if issues:
+        raise ValueError('；'.join(issues))
+
+    usage = data.get('usage') or {}
+    return outline, {
+        'prompt_tokens': usage.get('prompt_tokens', 0),
+        'completion_tokens': usage.get('completion_tokens', 0),
+        'total_tokens': usage.get('total_tokens', 0),
+        'finish_reason': choice.get('finish_reason'),
+    }
 
 
 def _current_dayun_label(paipan_data):
@@ -284,12 +422,31 @@ def stream_interpretation(paipan_data):
         yield 'data: {"error": "DeepSeek API Key未配置"}\n\n'
         return
 
-    system_prompt, user_prompt = build_prompt(paipan_data)
-
     headers = {
         'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
         'Content-Type': 'application/json'
     }
+    analysis_outline = None
+    structure_usage = {
+        'prompt_tokens': 0,
+        'completion_tokens': 0,
+        'total_tokens': 0,
+        'finish_reason': None,
+    }
+    structured_ok = False
+    structured_error = ''
+
+    if STRUCTURED_GENERATION_ENABLED:
+        yield f'data: {json.dumps({"status": "正在先立命盘分析骨架...", "progress": 18}, ensure_ascii=False)}\n\n'
+        try:
+            analysis_outline, structure_usage = request_structured_outline(paipan_data, headers)
+            structured_ok = True
+            yield f'data: {json.dumps({"status": "分析骨架已成，正在润色成文...", "progress": 34}, ensure_ascii=False)}\n\n'
+        except (requests.exceptions.RequestException, ValueError, json.JSONDecodeError) as e:
+            structured_error = str(e)
+            yield f'data: {json.dumps({"status": "分析骨架未成，已自动改用直写保护体验...", "progress": 24}, ensure_ascii=False)}\n\n'
+
+    system_prompt, user_prompt = build_prompt(paipan_data, analysis_outline)
     payload = build_payload(system_prompt, user_prompt)
 
     try:
@@ -341,13 +498,22 @@ def stream_interpretation(paipan_data):
             except json.JSONDecodeError:
                 continue
 
-        # 发送token统计信息
+        # Send token usage including both structured outline and final writing phases.
+        final_prompt_tokens = prompt_tokens
+        final_completion_tokens = completion_tokens
+        prompt_tokens += structure_usage.get('prompt_tokens', 0)
+        completion_tokens += structure_usage.get('completion_tokens', 0)
         total_tokens = prompt_tokens + completion_tokens
         cost = calc_cost(prompt_tokens, completion_tokens)
         quality = validate_interpretation(full_text, paipan_data, finish_reason)
 
         if not quality['ok']:
-            yield f'data: {json.dumps({"error": "这次解读生成不完整，已为你保留次数，请重新开示。", "retryable": True, "validation_issues": quality["issues"]}, ensure_ascii=False)}\n\n'
+            error_payload = {
+                'error': '\u8fd9\u6b21\u89e3\u8bfb\u751f\u6210\u4e0d\u5b8c\u6574\uff0c\u5df2\u4e3a\u4f60\u4fdd\u7559\u6b21\u6570\uff0c\u8bf7\u91cd\u65b0\u5f00\u793a\u3002',
+                'retryable': True,
+                'validation_issues': quality['issues']
+            }
+            yield 'data: ' + json.dumps(error_payload, ensure_ascii=False) + '\n\n'
             return
 
         meta = {
@@ -358,7 +524,15 @@ def stream_interpretation(paipan_data):
             'cost_usd': cost,
             'finish_reason': finish_reason,
             'quality': quality,
-            'full_text': full_text  # 用于缓存
+            'structured_generation': structured_ok,
+            'structured_error': structured_error,
+            'structure_prompt_tokens': structure_usage.get('prompt_tokens', 0),
+            'structure_completion_tokens': structure_usage.get('completion_tokens', 0),
+            'structure_total_tokens': structure_usage.get('total_tokens', 0),
+            'structure_finish_reason': structure_usage.get('finish_reason'),
+            'final_prompt_tokens': final_prompt_tokens,
+            'final_completion_tokens': final_completion_tokens,
+            'full_text': full_text  # cache body
         }
         yield f'data: {json.dumps(meta, ensure_ascii=False)}\n\n'
 
