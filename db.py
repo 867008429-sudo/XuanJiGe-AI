@@ -91,6 +91,22 @@ def init_db():
             expires_at TEXT,
             FOREIGN KEY (account_id) REFERENCES accounts(id)
         );
+
+        -- 注册尝试表：用于防止同IP/同设备批量注册薅免费次数
+        CREATE TABLE IF NOT EXISTS registration_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT NOT NULL,
+            client_id TEXT DEFAULT '',
+            username TEXT DEFAULT '',
+            success INTEGER DEFAULT 0,
+            reason TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_registration_attempts_ip_time
+            ON registration_attempts(ip, created_at);
+        CREATE INDEX IF NOT EXISTS idx_registration_attempts_client_time
+            ON registration_attempts(client_id, created_at);
     ''')
     db.commit()
     db.close()
@@ -338,6 +354,82 @@ def get_stats():
         'total_tokens': total_tokens,
         'total_cost_usd': round(total_cost, 4),
     }
+
+
+def record_registration_attempt(ip, client_id, username, success, reason=''):
+    """记录注册尝试，供限流和风控使用。"""
+    db = get_db()
+    db.execute(
+        '''INSERT INTO registration_attempts
+           (ip, client_id, username, success, reason)
+           VALUES (?, ?, ?, ?, ?)''',
+        (
+            ip or 'unknown',
+            client_id or '',
+            (username or '')[:32],
+            1 if success else 0,
+            (reason or '')[:80],
+        )
+    )
+    db.commit()
+    db.close()
+
+
+def check_registration_gate(
+    ip,
+    client_id,
+    username,
+    window_minutes=60,
+    max_attempts=8,
+    daily_max_per_ip=2,
+    daily_max_per_client=1,
+):
+    """检查注册频率限制，返回 (allowed, error_message)。"""
+    ip = ip or 'unknown'
+    client_id = client_id or ''
+    db = get_db()
+
+    if max_attempts and max_attempts > 0:
+        recent_since = f'-{int(window_minutes)} minutes'
+        recent_attempts = db.execute(
+            '''SELECT COUNT(*) AS c
+               FROM registration_attempts
+               WHERE created_at >= datetime('now', ?)
+                 AND (ip = ? OR (? != '' AND client_id = ?))''',
+            (recent_since, ip, client_id, client_id)
+        ).fetchone()['c']
+        if recent_attempts >= max_attempts:
+            db.close()
+            return False, '注册尝试过于频繁，请稍后再试'
+
+    if daily_max_per_ip and daily_max_per_ip > 0:
+        ip_success = db.execute(
+            '''SELECT COUNT(*) AS c
+               FROM registration_attempts
+               WHERE success = 1
+                 AND ip = ?
+                 AND created_at >= datetime('now', '-1 day')''',
+            (ip,)
+        ).fetchone()['c']
+        if ip_success >= daily_max_per_ip:
+            db.close()
+            return False, '当前网络今日注册名额已用完，请明天再试'
+
+    if client_id and daily_max_per_client and daily_max_per_client > 0:
+        client_success = db.execute(
+            '''SELECT COUNT(*) AS c
+               FROM registration_attempts
+               WHERE success = 1
+                 AND client_id = ?
+                 AND created_at >= datetime('now', '-1 day')''',
+            (client_id,)
+        ).fetchone()['c']
+        if client_success >= daily_max_per_client:
+            db.close()
+            return False, '当前设备今日已注册过账号，请明天再试'
+
+    db.close()
+    return True, None
 
 
 # ==================== 账号系统 ====================

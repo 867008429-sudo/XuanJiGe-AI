@@ -51,6 +51,22 @@ app = Flask(__name__)
 CORS(app)
 
 
+def _csv_env(name):
+    """Read comma-separated env values without leaking secrets into the page."""
+    raw = os.environ.get(name, '')
+    return [item.strip() for item in raw.split(',') if item.strip()]
+
+
+REGISTRATION_INVITE_CODES = (
+    _csv_env('REGISTRATION_INVITE_CODES')
+    or _csv_env('REGISTRATION_INVITE_CODE')
+)
+REGISTRATION_RATE_WINDOW_MINUTES = int(os.environ.get('REGISTRATION_RATE_WINDOW_MINUTES', '60'))
+REGISTRATION_RATE_MAX_ATTEMPTS = int(os.environ.get('REGISTRATION_RATE_MAX_ATTEMPTS', '8'))
+REGISTRATION_DAILY_MAX_PER_IP = int(os.environ.get('REGISTRATION_DAILY_MAX_PER_IP', '2'))
+REGISTRATION_DAILY_MAX_PER_CLIENT = int(os.environ.get('REGISTRATION_DAILY_MAX_PER_CLIENT', '1'))
+
+
 # ==================== 用户指纹辅助 ====================
 
 def get_auth_token(req):
@@ -64,6 +80,14 @@ def get_auth_token(req):
     if token:
         return token
     return ''
+
+
+def get_client_ip(req):
+    """Get the best-effort client IP, supporting future reverse proxy deployment."""
+    forwarded = req.headers.get('X-Forwarded-For', '')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return req.remote_addr or 'unknown'
 
 
 def _client_fingerprint(req):
@@ -100,7 +124,7 @@ def get_fingerprint(req):
     if client_id:
         return hashlib.sha256(f"cid:{client_id}".encode()).hexdigest()[:32]
     # 3. 回退到 IP+UA
-    ip = req.headers.get('X-Forwarded-For', req.remote_addr or 'unknown')
+    ip = get_client_ip(req)
     ua = req.headers.get('User-Agent', 'unknown')
     return db.get_fingerprint(ip, ua)
 
@@ -197,7 +221,7 @@ def api_interpret():
     """
     # --- 用户识别 ---
     fingerprint = get_fingerprint(request)
-    ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown')
+    ip = get_client_ip(request)
     ua = request.headers.get('User-Agent', 'unknown')
 
     # 检查是否登录
@@ -374,15 +398,46 @@ def api_quota():
 
 # ==================== 账号系统 ====================
 
+@app.route('/api/auth-config', methods=['GET'])
+def api_auth_config():
+    """Expose safe auth UX flags without exposing invite codes."""
+    return jsonify({
+        'invite_required': bool(REGISTRATION_INVITE_CODES),
+    })
+
+
 @app.route('/api/register', methods=['POST'])
 def api_register():
     """注册"""
     data = request.json or {}
     username = (data.get('username') or '').strip()
     password = data.get('password', '')
+    invite_code = (data.get('invite_code') or '').strip()
+    client_id = (data.get('client_id') or request.headers.get('X-Client-Id', '') or '').strip()[:128]
+    client_ip = get_client_ip(request)
+
+    allowed, gate_error = db.check_registration_gate(
+        client_ip,
+        client_id,
+        username,
+        REGISTRATION_RATE_WINDOW_MINUTES,
+        REGISTRATION_RATE_MAX_ATTEMPTS,
+        REGISTRATION_DAILY_MAX_PER_IP,
+        REGISTRATION_DAILY_MAX_PER_CLIENT,
+    )
+    if not allowed:
+        db.record_registration_attempt(client_ip, client_id, username, False, gate_error)
+        return jsonify({'error': gate_error}), 429
+
+    if REGISTRATION_INVITE_CODES and invite_code not in REGISTRATION_INVITE_CODES:
+        db.record_registration_attempt(client_ip, client_id, username, False, '邀请码错误')
+        return jsonify({'error': '体验码不正确，请确认后再注册'}), 403
+
     token, error = db.register(username, password)
     if error:
+        db.record_registration_attempt(client_ip, client_id, username, False, error)
         return jsonify({'error': error}), 400
+    db.record_registration_attempt(client_ip, client_id, username, True, '')
     # 访客先排过的盘，注册后迁移到账号名下
     acct_fp = db.get_account_fingerprint(token)
     if acct_fp:
@@ -520,6 +575,8 @@ INDEX_HTML = r'''
             --gold-border: rgba(201,168,76,0.32); --gold-shadow: rgba(201,168,76,0.3);
             --red-tint: rgba(201,64,64,0.12); --red-border: rgba(201,64,64,0.75);
             --body-glow-a: rgba(201,168,76,0.05); --body-glow-b: rgba(139,32,32,0.05);
+            --sigil-ink: rgba(232,200,112,0.26); --sigil-ink-strong: rgba(232,200,112,0.4);
+            --scripture-ink: rgba(232,200,112,0.24); --cinnabar-ink: rgba(201,64,64,0.22);
             --modal-scrim: rgba(0,0,0,0.7); --overlay-bg: rgba(10,10,15,0.95);
             --theme-toggle-bg: rgba(201,168,76,0.1); --theme-toggle-hover: rgba(201,168,76,0.18);
         }
@@ -534,6 +591,8 @@ INDEX_HTML = r'''
             --gold-border: rgba(138,93,24,0.34); --gold-shadow: rgba(138,93,24,0.24);
             --red-tint: rgba(179,58,50,0.11); --red-border: rgba(179,58,50,0.65);
             --body-glow-a: rgba(138,93,24,0.12); --body-glow-b: rgba(179,58,50,0.08);
+            --sigil-ink: rgba(112,74,18,0.22); --sigil-ink-strong: rgba(112,74,18,0.34);
+            --scripture-ink: rgba(112,74,18,0.22); --cinnabar-ink: rgba(157,46,46,0.18);
             --modal-scrim: rgba(41,31,19,0.48); --overlay-bg: rgba(246,238,223,0.96);
             --theme-toggle-bg: rgba(138,93,24,0.1); --theme-toggle-hover: rgba(138,93,24,0.18);
         }
@@ -587,26 +646,26 @@ INDEX_HTML = r'''
             color: var(--gold); contain: strict;
         }
         .dao-sigil {
-            position: absolute; width: clamp(190px, 28vw, 340px); aspect-ratio: 1;
-            border-radius: 50%; opacity: 0.2; color: var(--gold-bright);
-            border: 1px solid var(--gold-border);
+            position: absolute; width: clamp(230px, 30vw, 390px); aspect-ratio: 1;
+            border-radius: 50%; opacity: 0.34; color: var(--gold-bright);
+            border: 1px solid var(--sigil-ink-strong);
             background:
-                radial-gradient(circle, transparent 0 26%, var(--gold-tint) 27% 28%, transparent 29% 45%, var(--gold-tint) 46% 47%, transparent 48%),
-                repeating-conic-gradient(from -4deg, transparent 0 17deg, var(--gold-tint-strong) 18deg 20deg, transparent 21deg 45deg);
-            box-shadow: inset 0 0 38px var(--gold-tint), 0 0 30px rgba(201,168,76,0.08);
+                radial-gradient(circle, transparent 0 23%, var(--sigil-ink) 24% 25%, transparent 26% 43%, var(--sigil-ink) 44% 45%, transparent 46%),
+                repeating-conic-gradient(from -4deg, transparent 0 15deg, var(--sigil-ink-strong) 16deg 18deg, transparent 19deg 45deg);
+            box-shadow: inset 0 0 52px var(--gold-tint-strong), 0 0 44px rgba(201,168,76,0.14);
             animation: sigil-breathe 12s ease-in-out infinite;
         }
         .dao-sigil::before, .dao-sigil::after {
             content: ''; position: absolute; inset: 16%; border-radius: 50%;
-            border: 1px solid var(--gold-border);
+            border: 1px solid var(--sigil-ink-strong);
         }
-        .dao-sigil::after { inset: 34%; opacity: 0.7; }
-        .dao-sigil-a { --sigil-rotate: -10deg; left: -76px; top: 96px; transform: rotate(var(--sigil-rotate)); }
-        .dao-sigil-b { --sigil-rotate: 18deg; right: -92px; bottom: 42px; transform: rotate(var(--sigil-rotate)); animation-delay: -5s; }
+        .dao-sigil::after { inset: 34%; opacity: 0.85; }
+        .dao-sigil-a { --sigil-rotate: -10deg; left: -52px; top: 82px; transform: rotate(var(--sigil-rotate)); }
+        .dao-sigil-b { --sigil-rotate: 18deg; right: -64px; bottom: 34px; transform: rotate(var(--sigil-rotate)); animation-delay: -5s; }
         .dao-trigram {
             position: absolute;
-            font-size: clamp(0.78rem, 1.6vw, 1.05rem); font-weight: 700;
-            letter-spacing: 0; text-shadow: 0 0 12px var(--gold-shadow);
+            font-size: clamp(0.88rem, 1.8vw, 1.18rem); font-weight: 700;
+            letter-spacing: 0; text-shadow: 0 0 14px var(--gold-shadow), 0 0 1px currentColor;
         }
         .dao-trigram:nth-child(1) { left: 50%; top: 8%; transform: translate(-50%, -50%); }
         .dao-trigram:nth-child(2) { right: 17%; top: 17%; transform: translate(50%, -50%); }
@@ -616,16 +675,31 @@ INDEX_HTML = r'''
         .dao-trigram:nth-child(6) { left: 17%; bottom: 17%; transform: translate(-50%, 50%); }
         .dao-trigram:nth-child(7) { left: 8%; top: 50%; transform: translate(-50%, -50%); }
         .dao-trigram:nth-child(8) { left: 17%; top: 17%; transform: translate(-50%, -50%); }
+        .dao-talisman {
+            position: absolute; width: clamp(74px, 8vw, 118px); min-height: clamp(230px, 28vw, 340px);
+            border: 1px solid var(--cinnabar-ink); border-radius: 48px;
+            color: var(--red-bright); opacity: 0.22;
+            display: flex; flex-direction: column; align-items: center; justify-content: space-around;
+            padding: 1.2rem 0.35rem; background: linear-gradient(180deg, transparent, var(--red-tint), transparent);
+            box-shadow: inset 0 0 28px var(--red-tint), 0 0 22px rgba(201,64,64,0.08);
+            animation: talisman-float 13s ease-in-out infinite;
+        }
+        .dao-talisman span {
+            writing-mode: vertical-rl; font-size: clamp(0.8rem, 1.25vw, 1.05rem);
+            line-height: 1; letter-spacing: 0.28em; text-shadow: 0 0 12px var(--red-tint);
+        }
+        .dao-talisman-a { --talisman-rotate: 8deg; right: 6vw; top: 33vh; }
+        .dao-talisman-b { --talisman-rotate: -7deg; left: 4vw; bottom: 7vh; animation-delay: -6s; }
         .scripture-flow {
-            position: absolute; max-width: 16rem;
-            font-size: clamp(0.72rem, 1.1vw, 0.98rem); line-height: 1.9;
-            letter-spacing: 0.16em; color: var(--gold-bright);
-            opacity: 0.13; text-shadow: 0 0 14px var(--gold-shadow);
+            position: absolute; max-width: 12.5rem;
+            font-size: clamp(0.58rem, 0.82vw, 0.78rem); line-height: 1.85;
+            letter-spacing: 0.18em; color: var(--gold-bright);
+            opacity: 0.2; text-shadow: 0 0 14px var(--gold-shadow), 0 0 1px var(--scripture-ink);
             filter: blur(0.05px); animation: scripture-ripple 9s ease-in-out infinite;
         }
         .scripture-flow::after {
-            content: ''; position: absolute; left: 50%; top: 50%; width: 140%; aspect-ratio: 1;
-            border-radius: 50%; border: 1px solid currentColor; opacity: 0.18;
+            content: ''; position: absolute; left: 50%; top: 50%; width: 155%; aspect-ratio: 1;
+            border-radius: 50%; border: 1px solid currentColor; opacity: 0.22;
             transform: translate(-50%, -50%) scale(0.72);
             animation: scripture-ring 5.8s ease-out infinite;
         }
@@ -635,14 +709,22 @@ INDEX_HTML = r'''
         .scripture-d { right: 16vw; bottom: 22vh; max-width: 15rem; animation-delay: -2.5s; }
         .scripture-e { left: 42vw; top: 8vh; max-width: 12rem; animation-delay: -7.2s; }
         .scripture-f { left: 52vw; bottom: 8vh; max-width: 13rem; animation-delay: -3.4s; }
+        .scripture-g { right: 29vw; top: 35vh; max-width: 10rem; animation-delay: -5.1s; }
+        .scripture-h { left: 28vw; bottom: 30vh; max-width: 10rem; animation-delay: -8s; }
+        .scripture-i { right: 6vw; bottom: 48vh; max-width: 9rem; animation-delay: -2s; }
+        .scripture-j { left: 3vw; top: 49vh; max-width: 9rem; animation-delay: -6.8s; }
         @keyframes sigil-breathe {
-            0%, 100% { opacity: 0.16; transform: translate3d(0,0,0) rotate(var(--sigil-rotate, 0deg)) scale(0.98); }
-            50% { opacity: 0.27; transform: translate3d(0,-6px,0) rotate(var(--sigil-rotate, 0deg)) scale(1.03); }
+            0%, 100% { opacity: 0.24; transform: translate3d(0,0,0) rotate(var(--sigil-rotate, 0deg)) scale(0.98); }
+            50% { opacity: 0.42; transform: translate3d(0,-6px,0) rotate(var(--sigil-rotate, 0deg)) scale(1.03); }
+        }
+        @keyframes talisman-float {
+            0%, 100% { opacity: 0.16; transform: translate3d(0,0,0) rotate(var(--talisman-rotate, 0deg)); }
+            50% { opacity: 0.28; transform: translate3d(0,-10px,0) rotate(var(--talisman-rotate, 0deg)); }
         }
         @keyframes scripture-ripple {
-            0%, 100% { opacity: 0.08; transform: translate3d(0, 0, 0) scale(0.985); }
-            45% { opacity: 0.18; transform: translate3d(10px, -8px, 0) scale(1.018); }
-            70% { opacity: 0.11; transform: translate3d(-7px, 6px, 0) scale(1.002); }
+            0%, 100% { opacity: 0.12; transform: translate3d(0, 0, 0) scale(0.982); }
+            45% { opacity: 0.28; transform: translate3d(10px, -8px, 0) scale(1.018); }
+            70% { opacity: 0.17; transform: translate3d(-7px, 6px, 0) scale(1.002); }
         }
         @keyframes scripture-ring {
             0% { opacity: 0.18; transform: translate(-50%, -50%) scale(0.62); }
@@ -1017,12 +1099,26 @@ INDEX_HTML = r'''
         }
         .auth-flow.is-leaving { opacity: 0; transform: translateX(var(--auth-slide-out, -10px)); }
         .auth-flow.is-entering { opacity: 0; transform: translateX(var(--auth-slide-in, 10px)); }
+        .auth-field { display: block; margin-bottom: 0.78rem; text-align: left; }
+        .auth-label { display: block; margin-bottom: 0.32rem; color: var(--text-dim); font-size: 0.78rem; }
         .auth-input {
             background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px;
             padding: 0.7rem; color: var(--text); font-family: inherit; font-size: 1rem;
-            width: 100%; box-sizing: border-box; margin-bottom: 0.8rem; min-height: 44px;
+            width: 100%; box-sizing: border-box; margin-bottom: 0; min-height: 44px;
         }
         .auth-input:focus { outline: none; border-color: var(--gold); }
+        .auth-invite-field {
+            max-height: 0; opacity: 0; overflow: hidden; margin-bottom: 0;
+            transform: translateY(-6px);
+            transition: max-height 0.28s cubic-bezier(.2,.85,.25,1), opacity 0.18s ease, transform 0.22s ease, margin-bottom 0.22s ease;
+        }
+        .auth-invite-field.visible { max-height: 92px; opacity: 1; margin-bottom: 0.78rem; transform: translateY(0); }
+        .auth-help {
+            color: var(--text-dim); font-size: 0.76rem; line-height: 1.55; text-align: left;
+            max-height: 0; opacity: 0; overflow: hidden; margin-bottom: 0;
+            transition: max-height 0.24s ease, opacity 0.18s ease, margin-bottom 0.2s ease;
+        }
+        .auth-help.visible { max-height: 44px; opacity: 1; margin-bottom: 0.8rem; }
         .auth-error { color: var(--red-bright); font-size: 0.85rem; margin-bottom: 0.8rem; min-height: 1.2rem; }
         .auth-switch { color: var(--gold-dim); font-size: 0.85rem; cursor: pointer; text-decoration: underline; margin-top: 0.5rem; display: block; }
         .auth-btn { width: 100%; box-sizing: border-box; }
@@ -1172,11 +1268,14 @@ INDEX_HTML = r'''
             .birth-wheel-label { font-size: 0.68rem; }
             .birth-wheel-item { font-size: 0.88rem; }
             .birth-picker-value { font-size: 0.95rem; }
-            .dao-sigil { width: 210px; opacity: 0.16; }
-            .dao-sigil-a { left: -112px; top: 118px; }
-            .dao-sigil-b { right: -120px; bottom: 40px; }
-            .scripture-flow { font-size: 0.68rem; max-width: 9.5rem; opacity: 0.1; letter-spacing: 0.1em; }
-            .scripture-b, .scripture-e { display: none; }
+            .dao-sigil { width: 225px; opacity: 0.24; }
+            .dao-sigil-a { left: -102px; top: 112px; }
+            .dao-sigil-b { right: -106px; bottom: 32px; }
+            .dao-talisman { width: 54px; min-height: 170px; opacity: 0.16; }
+            .dao-talisman-a { right: 1.4rem; top: 42vh; }
+            .dao-talisman-b { left: 0.8rem; bottom: 8vh; }
+            .scripture-flow { font-size: 0.56rem; max-width: 8.6rem; opacity: 0.15; letter-spacing: 0.12em; }
+            .scripture-b, .scripture-e, .scripture-i { display: none; }
             .auth-overlay { align-items: flex-end; padding: 0; }
             .auth-modal-card {
                 width: 100%; max-width: none; border-radius: 18px 18px 0 0; border-bottom: 0;
@@ -1208,12 +1307,18 @@ INDEX_HTML = r'''
             <span class="dao-trigram">乾</span><span class="dao-trigram">兑</span><span class="dao-trigram">离</span><span class="dao-trigram">震</span>
             <span class="dao-trigram">巽</span><span class="dao-trigram">坎</span><span class="dao-trigram">艮</span><span class="dao-trigram">坤</span>
         </div>
+        <div class="dao-talisman dao-talisman-a"><span>太上</span><span>玄门</span><span>敕令</span></div>
+        <div class="dao-talisman dao-talisman-b"><span>阴阳</span><span>五行</span><span>归藏</span></div>
         <div class="scripture-flow scripture-a">道可道，非常道。名可名，非常名。</div>
         <div class="scripture-flow scripture-b">天地定位，山泽通气，雷风相薄。</div>
         <div class="scripture-flow scripture-c">甲乙丙丁戊己庚辛，壬癸循环。</div>
         <div class="scripture-flow scripture-d">乾坤坎离，震巽艮兑，阴阳消息。</div>
         <div class="scripture-flow scripture-e">一阴一阳之谓道，顺逆之间见机。</div>
         <div class="scripture-flow scripture-f">子丑寅卯，辰巳午未，申酉戌亥。</div>
+        <div class="scripture-flow scripture-g">天干地支，各循其时。</div>
+        <div class="scripture-flow scripture-h">观象玩辞，知来藏往。</div>
+        <div class="scripture-flow scripture-i">河图洛书，数起中宫。</div>
+        <div class="scripture-flow scripture-j">三元九运，气随象转。</div>
     </div>
     <div class="header">
         <div class="logo">
@@ -1372,8 +1477,19 @@ INDEX_HTML = r'''
         <div class="modal auth-modal-card" onclick="event.stopPropagation()">
             <div class="auth-flow" id="authFlow">
             <div class="modal-title" id="authTitle">登录</div>
-            <input type="text" class="auth-input" id="authUsername" placeholder="用户名（2-20字符）" maxlength="20">
-            <input type="password" class="auth-input" id="authPassword" placeholder="密码（至少4位）" style="-webkit-text-security:disc;">
+            <label class="auth-field" for="authUsername">
+                <span class="auth-label">用户名</span>
+                <input type="text" class="auth-input" id="authUsername" placeholder="2-20字符" maxlength="20" autocomplete="username">
+            </label>
+            <label class="auth-field" for="authPassword">
+                <span class="auth-label">密码</span>
+                <input type="password" class="auth-input" id="authPassword" placeholder="至少4位" autocomplete="current-password" style="-webkit-text-security:disc;">
+            </label>
+            <label class="auth-field auth-invite-field" id="authInviteField" for="authInviteCode">
+                <span class="auth-label">体验码</span>
+                <input type="text" class="auth-input" id="authInviteCode" placeholder="请输入注册体验码" maxlength="48" autocomplete="off">
+            </label>
+            <div class="auth-help" id="authHelp">注册体验码用于控制测试名额，避免机器人批量注册消耗AI额度。</div>
             <div class="auth-error" id="authError"></div>
             <button class="modal-btn auth-btn" id="authSubmitBtn" onclick="handleAuth()">登录</button>
             <span class="auth-switch" id="authSwitch" onclick="switchAuthMode()">没有账号？去注册</span>
@@ -1459,6 +1575,16 @@ INDEX_HTML = r'''
         let isLoggedIn = false;        // 登录状态
         let lastQuota = null;          // 最近一次配额数据
         let pendingAIReading = null;   // 登录成功后待续的解读请求
+        let authInviteRequired = false; // 后端配置决定注册是否需要体验码
+
+        async function loadAuthConfig() {
+            try {
+                const res = await apiFetch('/api/auth-config');
+                const data = await res.json();
+                authInviteRequired = !!data.invite_required;
+                updateAuthUI();
+            } catch(e) {}
+        }
 
         // 命理典籍库（用于展示引据来源）
         const CLASSIC_BOOKS = ['滴天髓','子平真诠','穷通宝鉴','三命通会','渊海子平','神峰通考','命理约言','李虚中命书','黄金策','黄帝内经'];
@@ -1672,6 +1798,7 @@ INDEX_HTML = r'''
             document.getElementById('authError').textContent = '';
             document.getElementById('authUsername').value = '';
             document.getElementById('authPassword').value = '';
+            document.getElementById('authInviteCode').value = '';
             document.getElementById('authFlow').classList.remove('is-leaving', 'is-entering');
             updateAuthUI();
             document.getElementById('authModal').classList.add('active');
@@ -1718,18 +1845,33 @@ INDEX_HTML = r'''
         }
 
         function updateAuthUI() {
+            const isRegister = authMode === 'register';
             document.getElementById('authTitle').textContent = authMode === 'login' ? '登录' : '注册';
             document.getElementById('authSubmitBtn').textContent = authMode === 'login' ? '登录' : '注册';
             document.getElementById('authSwitch').textContent = authMode === 'login' ? '没有账号？去注册' : '已有账号？去登录';
+            const inviteField = document.getElementById('authInviteField');
+            const inviteInput = document.getElementById('authInviteCode');
+            const help = document.getElementById('authHelp');
+            const password = document.getElementById('authPassword');
+            if (password) password.setAttribute('autocomplete', isRegister ? 'new-password' : 'current-password');
+            if (inviteField) inviteField.classList.toggle('visible', isRegister && authInviteRequired);
+            if (inviteInput) inviteInput.required = isRegister && authInviteRequired;
+            if (help) help.classList.toggle('visible', isRegister && authInviteRequired);
         }
 
         async function handleAuth() {
             const username = document.getElementById('authUsername').value.trim();
             const password = document.getElementById('authPassword').value;
+            const inviteCode = document.getElementById('authInviteCode').value.trim();
             const errEl = document.getElementById('authError');
             errEl.textContent = '';
             if (!username || !password) {
                 errEl.textContent = '请填写用户名和密码';
+                return;
+            }
+            if (authMode === 'register' && authInviteRequired && !inviteCode) {
+                errEl.textContent = '请填写注册体验码';
+                document.getElementById('authInviteCode').focus({preventScroll: true});
                 return;
             }
             const btn = document.getElementById('authSubmitBtn');
@@ -1741,7 +1883,7 @@ INDEX_HTML = r'''
                 const res = await fetch(endpoint, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID},
-                    body: JSON.stringify({username, password})
+                    body: JSON.stringify({username, password, invite_code: inviteCode, client_id: CLIENT_ID})
                 });
                 const data = await res.json();
                 if (data.error) {
@@ -1805,6 +1947,7 @@ INDEX_HTML = r'''
                 updateAIGetBtn();
             } catch(e) {}
         }
+        loadAuthConfig();
         updateQuota();
 
         // === 历史记录 ===
