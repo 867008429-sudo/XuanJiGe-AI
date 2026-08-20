@@ -197,6 +197,8 @@ def api_interpret():
     # --- 查缓存（按账号隔离：该账号算过的八字，永远免费回放，即使配额用完也能看） ---
     cache_key = fingerprint + ':' + ai_service.build_cache_key(paipan_data)
     cached = db.get_cache(cache_key)
+    legacy_cache_key = fingerprint + ':' + ai_service.build_legacy_cache_key(paipan_data)
+    legacy_cached = None if cached else db.get_cache(legacy_cache_key)
 
     if cached:
         # 命盘已有解读存档（该账号算过的八字）：不消耗配额，直接回放
@@ -246,13 +248,14 @@ def api_interpret():
             }
         )
 
-    # --- 未命中缓存：先检查配额 ---
+    # --- 未命中新版缓存：旧版缓存存在则免费刷新，否则检查配额 ---
+    legacy_refresh = legacy_cached is not None
     quota_result = db.check_quota_account(auth_token)
     if quota_result is None:
         return jsonify({'error': '登录已过期，请重新登录', 'need_login': True}), 401
     can_use, free_remaining, is_free = quota_result
 
-    if not can_use:
+    if not can_use and not legacy_refresh:
         return jsonify({
             'error': '配额已用完',
             'message': '您的5次免费解读机会已用完',
@@ -272,7 +275,7 @@ def api_interpret():
             if chunk.startswith('data: ') and chunk.endswith('\n\n'):
                 try:
                     data = json.loads(chunk[6:].strip())
-                    if data.get('text') and not quota_consumed:
+                    if data.get('text') and not quota_consumed and not legacy_refresh:
                         # 收到第一个文本chunk，消耗配额（已确保登录）
                         db.consume_quota_account(auth_token, is_free)
                         quota_consumed = True
@@ -316,7 +319,8 @@ def api_interpret():
             'Cache-Control': 'no-cache',
             'X-Accel-Buffering': 'no',  # Nginx不缓冲
             'X-Free-Remaining': str(free_remaining),
-            'X-Is-Free': str(is_free).lower(),
+            'X-Is-Free': str(is_free or legacy_refresh).lower(),
+            'X-Cache-Refresh': str(legacy_refresh).lower(),
         }
     )
 

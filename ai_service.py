@@ -6,12 +6,9 @@ DeepSeek API调用：流式输出(SSE) + token计数 + 缓存 + 成本控制
 1. 流式输出(SSE) - 用户即时看到结果，体验好
 2. 结果缓存 - 相同生辰不重复调用API
 3. max_tokens限制 - 控制输出长度
-4. 精简system prompt - 减少input token
-5. 使用deepseek-chat(便宜)而非deepseek-reasoner(贵)
+4. 结构化命盘喂料 - 让模型依据盘面证据解读
+5. 使用 deepseek-v4-flash - 适合中文长文本输出
 6. 分段解读 - 用户可选看哪个方面，避免一次长输出
-
-DeepSeek定价参考:
-- deepseek-chat: input ¥0.5/百万token, output ¥1/百万token (约$0.07/$0.14)
 """
 import os
 import json
@@ -21,16 +18,19 @@ from flask import Response
 
 # DeepSeek API配置
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
-DEEPSEEK_API_URL = os.environ.get('DEEPSEEK_API_URL', 'https://api.deepseek.com/v1/chat/completions')
-DEEPSEEK_MODEL = 'deepseek-chat'  # 便宜模型，不是reasoner
+DEEPSEEK_API_URL = os.environ.get('DEEPSEEK_API_URL', 'https://api.deepseek.com/chat/completions')
+DEEPSEEK_MODEL = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')  # 适合中文长文本输出，可用环境变量切换
 
 # 成本控制参数
-MAX_TOKENS = 4000  # 限制输出长度，控制成本
-TEMPERATURE = 0.7
+MAX_TOKENS = int(os.environ.get('DEEPSEEK_MAX_TOKENS', '6000'))  # 限制输出长度，控制成本
+TEMPERATURE = float(os.environ.get('DEEPSEEK_TEMPERATURE', '0.7'))
+THINKING_ENABLED = os.environ.get('DEEPSEEK_THINKING', '0').lower() not in ('0', 'false', 'off', 'no')
+REASONING_EFFORT = os.environ.get('DEEPSEEK_REASONING_EFFORT', 'high')
+PROMPT_VERSION = 'interpretation-v4-flash'
 
-# Token价格（美元）
-INPUT_PRICE_PER_M = 0.07   # $0.07/百万input token
-OUTPUT_PRICE_PER_M = 0.14  # $0.14/百万output token
+# Token价格（美元）。不同模型/时段价格会变，生产可用环境变量覆盖。
+INPUT_PRICE_PER_M = float(os.environ.get('DEEPSEEK_INPUT_PRICE_PER_M_USD', '0.56'))
+OUTPUT_PRICE_PER_M = float(os.environ.get('DEEPSEEK_OUTPUT_PRICE_PER_M_USD', '3.78'))
 
 
 def calc_cost(prompt_tokens, completion_tokens):
@@ -40,63 +40,94 @@ def calc_cost(prompt_tokens, completion_tokens):
     return round(input_cost + output_cost, 6)
 
 
+def _cache_identity(paipan_data):
+    """
+    根据排盘数据生成命盘身份。
+    相同的年月日时性别 → 相同的命盘身份
+    """
+    return f"{paipan_data.get('solar_date', '')}_{paipan_data.get('gender', '')}"
+
+
 def build_cache_key(paipan_data):
     """
-    根据排盘数据生成缓存key
-    相同的年月日时性别 → 相同的解读
+    根据排盘数据、prompt版本和生成策略生成缓存key。
+    prompt或模型策略升级后自动避开旧的低质量解读缓存。
     """
-    key_raw = f"{paipan_data.get('solar_date', '')}_{paipan_data.get('gender', '')}"
+    thinking_flag = 'thinking' if THINKING_ENABLED else 'direct'
+    key_raw = f"{PROMPT_VERSION}_{DEEPSEEK_MODEL}_{thinking_flag}_{_cache_identity(paipan_data)}"
     return hashlib.md5(key_raw.encode()).hexdigest()
+
+
+def build_legacy_cache_key(paipan_data):
+    """旧版缓存key，用于识别已扣过配额的历史解读并免费刷新。"""
+    key_raw = _cache_identity(paipan_data)
+    return hashlib.md5(key_raw.encode()).hexdigest()
+
+
+def _text(value, default='无'):
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        return '、'.join(str(v) for v in value) if value else default
+    value = str(value).strip()
+    return value if value else default
+
+
+def _pillar_line(label, pillar):
+    gan = pillar.get('gan', '')
+    zhi = pillar.get('zhi', '')
+    return (
+        f"{label}：{gan}{zhi}，天干十神={_text(pillar.get('gan_shishen'))}，"
+        f"地支主气十神={_text(pillar.get('zhi_shishen'))}，"
+        f"藏干={_text(pillar.get('zhi_canggan'))}，纳音={_text(pillar.get('nayin'))}"
+    )
+
+
+def _gender_label(gender):
+    return {'male': '男命', 'female': '女命'}.get(gender, '未注明')
+
+
+def _wuxing_line(paipan_data):
+    count = paipan_data.get('wuxing_count', {})
+    percent = paipan_data.get('wuxing_percent', {})
+    return '；'.join(
+        f"{wx}{count.get(wx, 0)}个/{percent.get(wx, 0)}%"
+        for wx in ['金', '木', '水', '火', '土']
+    )
 
 
 def build_prompt(paipan_data):
     """
     构造发给DeepSeek的prompt
     设计思路:
-    - system: 角色设定+命理分析框架+古籍引用要求
-    - user: 结构化排盘数据 + 分析指引
+    - system: 角色设定 + 读盘方法 + 输出质量约束
+    - user: 结构化排盘数据 + 当前大运 + 每个板块的分析抓手
     """
     fp = paipan_data.get('four_pillars', {})
 
     system = (
-        '你是玄机阁的老道长，自幼出家研习命理五十载，精通《滴天髓》《子平真诠》《穷通宝鉴》《三命通会》《渊海子平》《神峰通考》《命理约言》《李虚中命书》等命理经典，阅盘无数。'
-        '你解读命盘绘声绘色、有血有肉：善用意象比喻（如"命如春木逢甘霖，自有一番生机""财星深藏库中，似灯下藏金，须点灯方见"），像说书人一样娓娓道来，'
-        '让善信读来如临其境、如见其人；术语随讲随用大白话点破，不堆砌名词，不说车轱辘话，不端着架子。'
-        '\n\n分析原则：'
-        '1. 身旺者喜克泄耗（官杀/食伤/财星），忌生扶（印星/比劫）'
-        '2. 身弱者喜生扶（印星/比劫），忌克泄耗'
-        '3. 偏财格主意外之财、经商之财，正财格主固定工资之财'
-        '4. 七杀为用主魄力竞争，七杀为忌主灾祸压力'
-        '5. 日支为配偶宫，看日支十神和冲合判断婚姻'
-        '6. 五行偏旺者该五行对应脏腑需注意健康'
-        '7. 大运看天干地支十神，与日主生克关系定吉凶'
-        '\n\n文风要求：'
-        '1. 每个板块开头先用一两句有画面感的总起，先立意象再拆解命理，如性格板块可写"善信日主甲木生于春月，恰似参天大树立于东方沃土，天生一股向上的劲头"'
-        '2. 讲吉凶要具体生动：说财运就描绘求财的门路与时机，说婚姻就描绘相处模式与缘分样貌，说健康就点明起居宜忌，避免"财运不错""婚姻和谐"这类空话'
-        '3. 该提醒的地方要直言不讳，该宽慰的地方也要给善信留有盼头，言之有物，吉凶有据'
-        '4. 总评结尾以道长口吻赠善信一句箴言收束全篇'
+        '你是玄机阁的老道长，任务不是泛泛安慰，而是根据给定命盘做具体、克制、有证据的八字解读。'
+        '排盘结果已经由本地历法引擎算好，你不得重新排盘、不得改四柱、不得质疑日期，只能依据给定数据分析。'
+        '你的口吻要有古典命理味，但要说人话：先抓盘面矛盾，再落到性格、求财、感情、健康、行运上的具体现象。'
+        '\n\n读盘方法：'
+        '1. 每个结论必须能回扣至少两个盘面证据，例如月令、日主强弱、十神、藏干、五行偏枯、地支冲合、当前大运。'
+        '2. 身旺喜克泄耗，身弱喜生扶；不要只背规则，要说清楚为什么这个盘如此取用。'
+        '3. 财运要区分财星是否透出、是否有根、是否为喜忌、适合稳定收入还是项目经营，不许只写"财运不错"。'
+        '4. 婚姻男命重点看财星与日支，女命重点看官杀与日支，同时看冲合刑害；要讲相处模式，不作绝对断语。'
+        '5. 健康只做养生提醒，不作疾病诊断；五行偏旺偏弱要落到作息、饮食、压力管理等可执行建议。'
+        '6. 大运必须先分析标记为当前大运的那一步，再顺带看未来2-3步，不得把未来大运说成当下。'
+        '\n\n质量要求：'
+        '1. 每个板块采用"盘面抓手 → 现实映射 → 建议提醒"的结构，但不要写成列表。'
+        '2. 多用具体场景和动作，例如"适合在规则清楚的平台里凭专业吃饭"，少用空词，例如"比较顺利""贵人相助"。'
+        '3. 可以直言短板，但要留改运空间；避免恐吓、宿命化、医疗/投资/婚姻绝对建议。'
+        '4. 古籍引用要短，作为义理点睛；不要编造书名之外的版本、卷页、作者生平。'
         '\n\n格式要求：'
-        '1. 不要使用任何markdown格式（不要用**加粗**、不要用#标题、不要用-列表）'
-        '2. 每个板块用【】标记开头，如【性格】【财运】【婚姻】【健康】【大运】【总评】'
-        '3. 每方面解读末尾用"——"引出所依据的古籍原文，每方面至少引用2-3部不同古籍的原句，如：——滴天髓云：旺者冲衰衰者拔；——子平真诠云：财气通门户者，未有不富者也'
-        '4. 板块内直接写内容，换行分段即可'
-        '5. 每方面5-8句话深入分析加2-3句古籍引用，总字数控制在2000-3500字'
-        '6. 不要只引用一句古籍就结束一个板块，要综合多部古籍交叉印证'
+        '1. 只输出正文，不要寒暄，不要markdown，不要编号列表。'
+        '2. 必须严格按这六个板块输出且顺序不变：【性格】【财运】【婚姻】【健康】【大运】【总评】。'
+        '3. 每个板块3-5段，每段2-4句；每个板块末尾用2句"——书名云：短句/义理"格式引用不同古籍。'
+        '4. 总字数控制在2600-3800字，宁可少而准，不要为了字数重复。'
     )
 
-    user = f"""排盘数据：
-日主：{paipan_data.get('day_master', '')}({paipan_data.get('day_master_wuxing', '')})
-格局：{paipan_data.get('geju', '')}
-{paipan_data.get('shenwang', '')}
-四柱：{fp.get('year',{}).get('gan','')}{fp.get('year',{}).get('zhi','')} | {fp.get('month',{}).get('gan','')}{fp.get('month',{}).get('zhi','')} | {fp.get('day',{}).get('gan','')}{fp.get('day',{}).get('zhi','')} | {fp.get('hour',{}).get('gan','')}{fp.get('hour',{}).get('zhi','')}
-十神：{fp.get('year',{}).get('gan_shishen','')} | {fp.get('month',{}).get('gan_shishen','')} | 日主 | {fp.get('hour',{}).get('gan_shishen','')}
-日支十神：{fp.get('day',{}).get('zhi_shishen','')}
-五行：金{paipan_data.get('wuxing_count',{}).get('金',0)} 木{paipan_data.get('wuxing_count',{}).get('木',0)} 水{paipan_data.get('wuxing_count',{}).get('水',0)} 火{paipan_data.get('wuxing_count',{}).get('火',0)} 土{paipan_data.get('wuxing_count',{}).get('土',0)}
-喜用：{','.join(paipan_data.get('xiyong',[]))}
-忌神：{paipan_data.get('jishen','')}
-神煞：{', '.join(paipan_data.get('shensha',[])) if paipan_data.get('shensha') else '无'}
-地支：{', '.join(paipan_data.get('zhi_relations',[])) if paipan_data.get('zhi_relations') else '无特殊'}
-大运："""
     import datetime as _dt
     current_year = _dt.datetime.now().year
     solar_date_str = paipan_data.get('solar_date', '')
@@ -105,28 +136,75 @@ def build_prompt(paipan_data):
     birth_year = int(year_match.group(1)) if year_match else current_year
     current_age = current_year - birth_year
 
+    dayun_lines = []
     for dy in paipan_data.get('dayun', []):
         is_current = current_age >= dy['start_age'] and current_age <= dy['end_age']
         marker = ' ← 当前大运' if is_current else ''
         year_info = f"({dy.get('start_year','')}-{dy.get('end_year','')}年)" if dy.get('start_year') else ''
-        user += f"\n  {dy['start_age']}-{dy['end_age']}岁 {year_info} {dy['gan']}{dy['zhi']}({dy['gan_shishen']}){marker}"
+        dayun_lines.append(
+            f"{dy['start_age']}-{dy['end_age']}岁 {year_info} "
+            f"{dy['gan']}{dy['zhi']}，天干={dy.get('gan_shishen','')}，"
+            f"地支={dy.get('zhi_shishen','')}，纳音={dy.get('nayin','')}{marker}"
+        )
 
-    user += f"""
+    user = f"""命盘资料：
+性别：{_gender_label(paipan_data.get('gender'))}
+公历：{paipan_data.get('solar_date', '')}
+农历：{paipan_data.get('lunar_date', '')}
+日主：{paipan_data.get('day_master', '')}（{paipan_data.get('day_master_wuxing', '')}）
+格局：{paipan_data.get('geju', '')}
+旺弱：{paipan_data.get('shenwang', '')}
+起运：{paipan_data.get('qiyun_age', '')}岁，{'顺行' if paipan_data.get('forward') else '逆行'}
+
+四柱细节：
+{_pillar_line('年柱', fp.get('year', {}))}
+{_pillar_line('月柱', fp.get('month', {}))}
+{_pillar_line('日柱', fp.get('day', {}))}
+{_pillar_line('时柱', fp.get('hour', {}))}
+
+五行分布：{_wuxing_line(paipan_data)}
+喜用：{_text(paipan_data.get('xiyong'))}
+忌神：{_text(paipan_data.get('jishen'))}
+神煞：{_text(paipan_data.get('shensha'))}
+地支关系：{_text(paipan_data.get('zhi_relations'), '无特殊冲合刑害')}
+
+大运列表：
+{chr(10).join(dayun_lines)}
 
 当前年龄：{current_age}岁（{birth_year}年生，{current_year}年）
-请特别注意：当前大运已在上表中用"← 当前大运"标记，分析大运时必须基于正确的当前大运，不要搞错年龄和对应的大运。
+当前大运已用"← 当前大运"标记，大运板块必须围绕这一运展开。
 
-请按六方面深入解读，每方面5-8句话加2-3句不同古籍的引用：
-1.【性格】根据日主天干特性（甲木参天、乙木柔蔓等）、十神组合（食神秀气、七杀威权等）、综合《滴天髓》论天干、《子平真诠》论十神、《三命通会》论性情分析性格
-2.【财运】根据格局高低、财星旺衰、喜用是否到位，综合《滴天髓》论财、《子平真诠》论用神、《穷通宝鉴》论调候分析财运
-3.【婚姻】根据日支十神、地支冲合、财官状态，综合《渊海子平》论六亲、《三命通会》论女命分析婚姻
-4.【健康】根据五行偏旺偏弱、脏腑对应，综合《黄帝内经》五行对应、《三命通会》论疾厄分析健康
-5.【大运】分析当前大运（已标记）的干支十神、与日主喜忌关系、吉凶判断，以及未来2-3步大运走势，引用《滴天髓》论运、《子平真诠》论行运
-6.【总评】综合以上各方面，整体评价命格层次高低、人生格局、注意事项
-
-引用古籍范围：《滴天髓》《子平真诠》《穷通宝鉴》《三命通会》《渊海子平》《神峰通考》《命理约言》《李虚中命书》《黄金策》
-每方面必须引用至少2部不同古籍的原句，交叉印证，不可只引一部"""
+请输出六个板块：
+【性格】抓日主、月令、比劫/食伤/官杀/印星组合，讲处事风格、优点、盲区。
+【财运】抓财星、食伤生财、官杀制身、喜忌和大运，讲赚钱路径、风险点、适合的工作/项目形态。
+【婚姻】按性别取六亲，结合日支、财官、冲合，讲亲密关系中的吸引点、摩擦点、相处建议。
+【健康】结合五行偏枯和火土金木水强弱，只给养生级建议，不做疾病诊断。
+【大运】先讲当前大运，再讲未来2-3步趋势；每一步都要说明干支十神与喜忌的关系。
+【总评】提炼命格主线、成事方式、最该修的短板和一句道长赠言。"""
     return system, user
+
+
+def build_payload(system_prompt, user_prompt):
+    """构造DeepSeek Chat Completions请求体，兼容V4思考模式。"""
+    payload = {
+        'model': DEEPSEEK_MODEL,
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt}
+        ],
+        'max_tokens': MAX_TOKENS,
+        'stream': True,
+        'stream_options': {
+            'include_usage': True
+        }
+    }
+    if THINKING_ENABLED:
+        payload['thinking'] = {'type': 'enabled'}
+        payload['reasoning_effort'] = REASONING_EFFORT
+    else:
+        payload['thinking'] = {'type': 'disabled'}
+        payload['temperature'] = TEMPERATURE
+    return payload
 
 
 def stream_interpretation(paipan_data):
@@ -144,19 +222,7 @@ def stream_interpretation(paipan_data):
         'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
         'Content-Type': 'application/json'
     }
-    payload = {
-        'model': DEEPSEEK_MODEL,
-        'messages': [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_prompt}
-        ],
-        'temperature': TEMPERATURE,
-        'max_tokens': MAX_TOKENS,
-        'stream': True,  # 流式输出
-        'stream_options': {
-            'include_usage': True  # 返回token用量
-        }
-    }
+    payload = build_payload(system_prompt, user_prompt)
 
     try:
         resp = requests.post(
@@ -187,11 +253,11 @@ def stream_interpretation(paipan_data):
             try:
                 chunk = json.loads(data_str)
 
-                # 提取文本内容
+                # 提取最终正文。V4思考模式可能返回 reasoning_content 或 content=None，这些不推给前端。
                 if 'choices' in chunk and chunk['choices']:
                     delta = chunk['choices'][0].get('delta', {})
-                    if 'content' in delta:
-                        text = delta['content']
+                    text = delta.get('content')
+                    if isinstance(text, str) and text:
                         full_text += text
                         # SSE格式发送给前端
                         yield f'data: {json.dumps({"text": text}, ensure_ascii=False)}\n\n'
@@ -219,4 +285,4 @@ def stream_interpretation(paipan_data):
         yield f'data: {json.dumps(meta, ensure_ascii=False)}\n\n'
 
     except requests.exceptions.RequestException as e:
-        yield f'data: {json.dumps({"error": f"API调用失败: {str(e)}"})}\n\n'
+        yield f'data: {json.dumps({"error": f"API调用失败: {str(e)}"}, ensure_ascii=False)}\n\n'
