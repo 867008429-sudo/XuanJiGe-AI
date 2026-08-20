@@ -262,11 +262,10 @@ def api_interpret():
             'need_recharge': True
         }), 403
 
-    # --- 在流式生成中消耗配额（AI失败则不消耗） ---
+    # --- 在流式成功且通过质量校验后消耗配额 ---
     def generate():
         full_text = ''
         meta = {}
-        quota_consumed = False
 
         for chunk in ai_service.stream_interpretation(paipan_data):
             yield chunk
@@ -275,10 +274,6 @@ def api_interpret():
             if chunk.startswith('data: ') and chunk.endswith('\n\n'):
                 try:
                     data = json.loads(chunk[6:].strip())
-                    if data.get('text') and not quota_consumed and not legacy_refresh:
-                        # 收到第一个文本chunk，消耗配额（已确保登录）
-                        db.consume_quota_account(auth_token, is_free)
-                        quota_consumed = True
                     if data.get('done'):
                         full_text = data.get('full_text', '')
                         meta = data
@@ -290,6 +285,8 @@ def api_interpret():
 
         # 保存到缓存
         if full_text and meta.get('total_tokens'):
+            if not legacy_refresh:
+                db.consume_quota_account(auth_token, is_free)
             paipan_json = json.dumps(paipan_data, ensure_ascii=False)
             db.save_cache(
                 cache_key, paipan_json, full_text,
@@ -476,14 +473,48 @@ INDEX_HTML = r'''
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>玄机阁 · 八字排盘</title>
+    <script>
+        (function() {
+            try {
+                var savedTheme = localStorage.getItem('xjg_theme');
+                var prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+                var theme = savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : (prefersLight ? 'light' : 'dark');
+                document.documentElement.dataset.theme = theme;
+            } catch (e) {
+                document.documentElement.dataset.theme = 'dark';
+            }
+        })();
+    </script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
+            color-scheme: dark;
             --bg-dark: #0a0a0f; --bg-card: #15151f; --bg-card-hover: #1a1a28;
             --border: #2a2a3a; --gold: #c9a84c; --gold-bright: #e8c870;
             --gold-dim: #8a7030; --text: #d4c8a8; --text-dim: #6a6a7a;
             --red: #8b2020; --red-bright: #c94040; --green: #4a9a4a;
+            --button-text: #0a0a0f; --header-bg: rgba(10,10,15,0.82);
+            --gold-tint: rgba(201,168,76,0.12); --gold-tint-strong: rgba(201,168,76,0.18);
+            --gold-border: rgba(201,168,76,0.32); --gold-shadow: rgba(201,168,76,0.3);
+            --red-tint: rgba(201,64,64,0.12); --red-border: rgba(201,64,64,0.75);
+            --body-glow-a: rgba(201,168,76,0.05); --body-glow-b: rgba(139,32,32,0.05);
+            --modal-scrim: rgba(0,0,0,0.7); --overlay-bg: rgba(10,10,15,0.95);
+            --theme-toggle-bg: rgba(201,168,76,0.1); --theme-toggle-hover: rgba(201,168,76,0.18);
+        }
+        html[data-theme="light"] {
+            color-scheme: light;
+            --bg-dark: #f6eedf; --bg-card: #fffaf0; --bg-card-hover: #fff2d2;
+            --border: #d8c491; --gold: #8a5d18; --gold-bright: #704a12;
+            --gold-dim: #7a5314; --text: #34291b; --text-dim: #75634a;
+            --red: #9d2e2e; --red-bright: #b33a32; --green: #347b43;
+            --button-text: #fffaf0; --header-bg: rgba(255,250,240,0.88);
+            --gold-tint: rgba(138,93,24,0.12); --gold-tint-strong: rgba(138,93,24,0.18);
+            --gold-border: rgba(138,93,24,0.34); --gold-shadow: rgba(138,93,24,0.24);
+            --red-tint: rgba(179,58,50,0.11); --red-border: rgba(179,58,50,0.65);
+            --body-glow-a: rgba(138,93,24,0.12); --body-glow-b: rgba(179,58,50,0.08);
+            --modal-scrim: rgba(41,31,19,0.48); --overlay-bg: rgba(246,238,223,0.96);
+            --theme-toggle-bg: rgba(138,93,24,0.1); --theme-toggle-hover: rgba(138,93,24,0.18);
         }
         body {
             font-family: 'Noto Serif SC', serif;
@@ -493,17 +524,18 @@ INDEX_HTML = r'''
             -webkit-text-size-adjust: 100%;
             -webkit-tap-highlight-color: transparent;
             background-image:
-                radial-gradient(ellipse at 20% 0%, rgba(201,168,76,0.05) 0%, transparent 50%),
-                radial-gradient(ellipse at 80% 100%, rgba(139,32,32,0.05) 0%, transparent 50%);
+                radial-gradient(ellipse at 20% 0%, var(--body-glow-a) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 100%, var(--body-glow-b) 0%, transparent 50%);
+            transition: background-color 0.25s ease, color 0.25s ease;
         }
         .header {
             border-bottom: 1px solid var(--border); padding: 0.5rem 0.75rem;
             padding-top: calc(0.5rem + env(safe-area-inset-top, 0px));
             display: flex; align-items: center; justify-content: space-between;
-            background: rgba(10,10,15,0.8); backdrop-filter: blur(10px);
+            background: var(--header-bg); backdrop-filter: blur(10px);
             position: sticky; top: 0; z-index: 100;
         }
-        .logo { display: flex; align-items: center; gap: 0.5rem; }
+        .logo { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
         .logo-taiji {
             width: 28px; height: 28px; border-radius: 50%;
             background: linear-gradient(135deg, var(--text) 50%, var(--bg-dark) 50%);
@@ -518,10 +550,40 @@ INDEX_HTML = r'''
         @keyframes spin { to { transform: rotate(360deg); } }
         .logo-text { font-size: 1.1rem; font-weight: 700; color: var(--gold); letter-spacing: 0.15em; }
         .header-sub { font-size: 0.7rem; color: var(--text-dim); }
+        .header-actions { display: flex; align-items: center; gap: 0.65rem; flex-shrink: 0; }
+        .theme-toggle {
+            width: 44px; height: 44px; min-width: 44px; border-radius: 50%;
+            border: 1px solid var(--gold-border); background: var(--theme-toggle-bg);
+            color: var(--gold-bright); cursor: pointer; display: inline-flex;
+            align-items: center; justify-content: center; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+            -webkit-appearance: none; touch-action: manipulation;
+        }
+        .theme-toggle:hover { background: var(--theme-toggle-hover); border-color: var(--gold); }
+        .theme-toggle:active { transform: scale(0.96); }
+        .theme-toggle:focus-visible { outline: 2px solid var(--gold-bright); outline-offset: 3px; }
+        .theme-toggle-icon { position: relative; width: 22px; height: 22px; display: block; }
+        .theme-toggle-icon::before {
+            content: ''; position: absolute; inset: 3px; border-radius: 50%;
+            border: 2px solid currentColor; box-shadow: inset -5px -3px 0 0 currentColor;
+            transition: all 0.2s ease;
+        }
+        html[data-theme="light"] .theme-toggle-icon::before {
+            inset: 5px; background: currentColor; border: 0;
+            box-shadow:
+                0 -8px 0 -5px currentColor,
+                0 8px 0 -5px currentColor,
+                8px 0 0 -5px currentColor,
+                -8px 0 0 -5px currentColor,
+                6px 6px 0 -5px currentColor,
+                -6px -6px 0 -5px currentColor,
+                6px -6px 0 -5px currentColor,
+                -6px 6px 0 -5px currentColor;
+        }
         .quota-badge {
-            background: rgba(201,168,76,0.15); border: 1px solid rgba(201,168,76,0.3);
-            border-radius: 20px; padding: 0.2rem 0.5rem;
-            font-size: 0.7rem; color: var(--gold); white-space: nowrap;
+            background: var(--gold-tint-strong); border: 1px solid var(--gold-border);
+            border-radius: 20px; padding: 0.2rem 0.6rem; min-height: 44px;
+            display: inline-flex; align-items: center; justify-content: center;
+            font-size: 0.7rem; color: var(--gold); white-space: nowrap; cursor: pointer;
         }
         .container { max-width: 900px; margin: 0 auto; padding: 0.75rem; padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px)); }
 
@@ -549,14 +611,14 @@ INDEX_HTML = r'''
         .btn-divine {
             display: block; width: 100%; padding: 0.8rem; margin-top: 0.75rem;
             background: linear-gradient(135deg, var(--gold-dim), var(--gold));
-            border: none; border-radius: 8px; color: var(--bg-dark);
+            border: none; border-radius: 8px; color: var(--button-text);
             font-family: inherit; font-size: 1.05rem; font-weight: 700;
             cursor: pointer; letter-spacing: 0.15em; transition: all 0.3s;
             min-height: 46px; -webkit-appearance: none;
         }
         .btn-divine:hover {
             background: linear-gradient(135deg, var(--gold), var(--gold-bright));
-            box-shadow: 0 4px 20px rgba(201,168,76,0.3);
+            box-shadow: 0 4px 20px var(--gold-shadow);
         }
         .btn-divine:disabled { opacity: 0.5; cursor: not-allowed; }
 
@@ -571,7 +633,7 @@ INDEX_HTML = r'''
         }
         .bazi-table table { width: 100%; border-collapse: collapse; min-width: 320px; }
         .bazi-table th {
-            background: rgba(201,168,76,0.1); color: var(--gold); padding: 0.8rem;
+            background: var(--gold-tint); color: var(--gold); padding: 0.8rem;
             font-weight: 700; border-bottom: 1px solid var(--border); font-size: 0.9rem;
         }
         .bazi-table td { padding: 0.8rem; text-align: center; border-bottom: 1px solid var(--border); color: var(--text); }
@@ -602,9 +664,9 @@ INDEX_HTML = r'''
         /* 大运表 */
         .dayun-table { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; margin-bottom: 1.5rem; }
         .dayun-table table { width: 100%; border-collapse: collapse; min-width: 360px; }
-        .dayun-table th { background: rgba(201,168,76,0.1); color: var(--gold); padding: 0.6rem; font-size: 0.85rem; border-bottom: 1px solid var(--border); }
+        .dayun-table th { background: var(--gold-tint); color: var(--gold); padding: 0.6rem; font-size: 0.85rem; border-bottom: 1px solid var(--border); }
         .dayun-table td { padding: 0.6rem; text-align: center; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
-        .dayun-current { background: rgba(201,168,76,0.08); }
+        .dayun-current { background: var(--gold-tint); }
 
         /* AI解读 */
         .ai-section {
@@ -617,6 +679,63 @@ INDEX_HTML = r'''
             border-radius: 12px 12px 0 0;
         }
         .ai-title { color: var(--red-bright); font-size: 1.2rem; margin-bottom: 1rem; text-align: center; }
+        .ai-summary-card {
+            margin-bottom: 1rem; padding: 0.85rem 0.9rem; border: 1px solid var(--gold-border);
+            border-radius: 10px; background: linear-gradient(135deg, var(--gold-tint), transparent);
+            animation: ai-rise 0.34s cubic-bezier(.2,.85,.25,1) both;
+        }
+        .ai-summary-kicker { font-size: 0.76rem; color: var(--text-dim); margin-bottom: 0.35rem; }
+        .ai-summary-main { color: var(--gold-bright); line-height: 1.75; font-size: 0.95rem; }
+        .ai-summary-pills { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.65rem; }
+        .ai-summary-pill {
+            border: 1px solid var(--border); border-radius: 999px; padding: 0.25rem 0.55rem;
+            color: var(--text); background: var(--bg-card-hover); font-size: 0.75rem; line-height: 1.4;
+        }
+        .ai-progress-panel {
+            margin-bottom: 1rem; padding: 0.85rem; border: 1px solid var(--border);
+            border-radius: 10px; background: var(--gold-tint); animation: ai-rise 0.34s cubic-bezier(.2,.85,.25,1) both;
+        }
+        .ai-status-row { display: flex; justify-content: space-between; gap: 1rem; align-items: center; margin-bottom: 0.65rem; }
+        .ai-status-text { color: var(--gold-bright); font-size: 0.86rem; }
+        .ai-progress-percent { color: var(--text-dim); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+        .ai-progress-track { height: 4px; background: var(--bg-dark); border-radius: 999px; overflow: hidden; }
+        .ai-progress-fill {
+            width: 0%; height: 100%; border-radius: 999px;
+            background: linear-gradient(90deg, var(--gold-dim), var(--gold-bright));
+            transition: width 0.45s cubic-bezier(.2,.85,.25,1);
+        }
+        .ai-step-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.45rem; margin-top: 0.75rem; }
+        .ai-step {
+            display: flex; align-items: center; gap: 0.4rem; min-height: 38px; padding: 0.35rem 0.45rem;
+            border: 1px solid var(--border); border-radius: 8px; color: var(--text-dim);
+            background: var(--bg-card); font-size: 0.74rem; transition: transform 0.22s ease, border-color 0.22s ease, color 0.22s ease, background 0.22s ease;
+        }
+        .ai-step-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: 0 0 auto; }
+        .ai-step[data-state="active"] { color: var(--gold-bright); border-color: var(--gold-border); background: var(--gold-tint); transform: translateY(-1px); }
+        .ai-step[data-state="active"] .ai-step-dot { background: var(--gold-bright); animation: ai-pulse 1.35s ease-in-out infinite; }
+        .ai-step[data-state="done"] { color: var(--gold); border-color: var(--gold-border); }
+        .ai-step[data-state="done"] .ai-step-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(74,154,74,0.12); }
+        .ai-quality-note {
+            margin: 0 0 1rem; padding: 0.75rem 0.85rem; border-radius: 9px;
+            border: 1px solid var(--gold-border); background: var(--gold-tint); color: var(--text);
+            font-size: 0.84rem; line-height: 1.65;
+        }
+        .ai-quality-note.error { border-color: var(--red-border); background: var(--red-tint); color: var(--red-bright); }
+        .ai-quality-note.success { color: var(--gold-bright); }
+        .ai-loading-card { color: var(--text-dim); font-size: 0.86rem; line-height: 1.7; }
+        .ai-skeleton { display: grid; gap: 0.5rem; margin-top: 0.65rem; }
+        .ai-skeleton-line {
+            position: relative; height: 10px; overflow: hidden; border-radius: 999px;
+            background: var(--bg-card-hover);
+        }
+        .ai-skeleton-line::after {
+            content: ''; position: absolute; inset: 0;
+            background: linear-gradient(90deg, transparent, var(--gold-tint-strong), transparent);
+            transform: translateX(-100%); animation: ai-shimmer 1.35s ease-in-out infinite;
+        }
+        @keyframes ai-rise { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        @keyframes ai-pulse { 0%, 100% { box-shadow: 0 0 0 0 var(--gold-shadow); } 50% { box-shadow: 0 0 0 5px transparent; } }
+        @keyframes ai-shimmer { to { transform: translateX(100%); } }
 
         /* Tab切换 */
         .ai-tabs {
@@ -625,29 +744,31 @@ INDEX_HTML = r'''
         }
         .ai-tab {
             padding: 0.6rem 1rem; font-size: 0.85rem; color: var(--text-dim);
-            cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s;
-            white-space: nowrap;
+            cursor: pointer; border: 0; border-bottom: 2px solid transparent; transition: all 0.2s;
+            white-space: nowrap; min-height: 44px; display: inline-flex; align-items: center;
+            background: transparent; font-family: inherit;
         }
         .ai-tab.active { color: var(--gold-bright); border-bottom-color: var(--gold); }
         .ai-tab:hover { color: var(--gold); }
+        .ai-tab:focus-visible { outline: 2px solid var(--gold-bright); outline-offset: -2px; }
         .ai-tab-content { display: none; }
         .ai-tab-content.active { display: block; }
         .ai-content { line-height: 1.9; color: var(--text); font-size: 0.95rem; min-height: 4rem; }
         .ai-para { margin: 0 0 0.55rem 0; }
         .ai-quote {
             margin: 0.5rem 0 0.85rem 0; padding: 0.45rem 0.75rem;
-            background: rgba(201,168,76,0.06); border-left: 3px solid var(--gold-dim);
+            background: var(--gold-tint); border-left: 3px solid var(--gold-dim);
             border-radius: 0 6px 6px 0; color: var(--gold);
             font-size: 0.86rem; font-style: italic; line-height: 1.8;
         }
         .ai-waiting { color: var(--text-dim); font-size: 0.85rem; }
         .ai-seal {
             display: none; margin: 1.4rem auto 0.2rem; width: 72px; height: 72px;
-            border: 2px solid rgba(201,64,64,0.75); border-radius: 8px;
+            border: 2px solid var(--red-border); border-radius: 8px;
             color: var(--red-bright); font-size: 0.95rem; font-weight: 700;
             align-items: center; justify-content: center; text-align: center;
             transform: rotate(-6deg); line-height: 1.35; letter-spacing: 0.15em;
-            box-shadow: inset 0 0 12px rgba(201,64,64,0.12);
+            box-shadow: inset 0 0 12px var(--red-tint);
         }
 
         .ai-meta { display: flex; gap: 1rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border); flex-wrap: wrap; }
@@ -676,14 +797,14 @@ INDEX_HTML = r'''
         /* 神煞标签 */
         .shensha-tags { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
         .shensha-tag {
-            background: rgba(201,168,76,0.15); border: 1px solid rgba(201,168,76,0.3);
+            background: var(--gold-tint-strong); border: 1px solid var(--gold-border);
             border-radius: 4px; padding: 0.2rem 0.6rem; font-size: 0.8rem; color: var(--gold);
         }
 
         /* 付费弹窗 */
         .modal-overlay {
             display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.7); z-index: 200;
+            background: var(--modal-scrim); z-index: 200;
             justify-content: center; align-items: center;
         }
         .modal-overlay.active { display: flex; }
@@ -693,7 +814,7 @@ INDEX_HTML = r'''
         }
         .modal-title { color: var(--gold); font-size: 1.2rem; margin-bottom: 1rem; }
         .modal-text { color: var(--text); margin-bottom: 1.5rem; line-height: 1.6; }
-        .modal-btn { background: linear-gradient(135deg, var(--gold-dim), var(--gold)); border: none; border-radius: 8px; padding: 0.8rem 2rem; color: var(--bg-dark); font-family: inherit; font-weight: 700; cursor: pointer; }
+        .modal-btn { background: linear-gradient(135deg, var(--gold-dim), var(--gold)); border: none; border-radius: 8px; padding: 0.8rem 2rem; color: var(--button-text); font-family: inherit; font-weight: 700; cursor: pointer; }
 
         /* 登录注册弹窗 */
         .auth-input {
@@ -705,7 +826,7 @@ INDEX_HTML = r'''
         .auth-error { color: var(--red-bright); font-size: 0.85rem; margin-bottom: 0.8rem; min-height: 1.2rem; }
         .auth-switch { color: var(--gold-dim); font-size: 0.85rem; cursor: pointer; text-decoration: underline; margin-top: 0.5rem; display: block; }
         .auth-btn { width: 100%; box-sizing: border-box; }
-        .user-badge { font-size: 0.8rem; color: var(--gold-bright); cursor: pointer; }
+        .user-badge { font-size: 0.8rem; color: var(--gold-bright); cursor: pointer; min-height: 44px; display: inline-flex; align-items: center; }
 
         /* 历史记录 */
         .history-section {
@@ -736,7 +857,7 @@ INDEX_HTML = r'''
         /* 演算动画遮罩 */
         .divine-overlay {
             display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(10,10,15,0.95); z-index: 300;
+            background: var(--overlay-bg); z-index: 300;
             justify-content: center; align-items: center; flex-direction: column;
             backdrop-filter: blur(8px);
         }
@@ -749,7 +870,7 @@ INDEX_HTML = r'''
             border: 3px solid var(--gold);
             position: relative; z-index: 1;
             animation: divine-spin 1.2s linear infinite;
-            box-shadow: 0 0 40px rgba(201,168,76,0.3);
+            box-shadow: 0 0 40px var(--gold-shadow);
         }
         .divine-taiji::before {
             content: ''; position: absolute; top: 25%; left: 50%;
@@ -767,7 +888,7 @@ INDEX_HTML = r'''
             position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
             width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
             z-index: 2; font-size: 2rem; color: var(--gold-bright);
-            text-shadow: 0 0 20px rgba(201,168,76,0.5);
+            text-shadow: 0 0 20px var(--gold-shadow);
         }
         @keyframes divine-spin { to { transform: rotate(360deg); } }
 
@@ -792,7 +913,7 @@ INDEX_HTML = r'''
             position: absolute; top: 50%; left: 50%;
             margin-top: -100px; margin-left: -100px;
             width: 200px; height: 200px;
-            border: 1px solid rgba(201,168,76,0.15); border-radius: 50%;
+            border: 1px solid var(--gold-tint-strong); border-radius: 50%;
             animation: ring-pulse 2s ease-in-out infinite;
             z-index: 0;
         }
@@ -824,6 +945,15 @@ INDEX_HTML = r'''
 
         /* 移动端动画优化 */
         @media (max-width: 600px) {
+            .header { gap: 0.5rem; }
+            .header-actions { gap: 0.45rem; }
+            .logo-text { letter-spacing: 0.1em; }
+            .header-sub { font-size: 0.65rem; }
+            .user-badge, .quota-badge {
+                max-width: 6.8rem; overflow: hidden; text-overflow: ellipsis;
+            }
+            .ai-step-grid { grid-template-columns: repeat(2, 1fr); }
+            .ai-status-row { align-items: flex-start; }
             .divine-taiji { width: 90px; height: 90px; }
             .divine-taiji::before, .divine-taiji::after { width: 45px; height: 45px; }
             .divine-taiji-inner { font-size: 1.5rem; }
@@ -831,6 +961,12 @@ INDEX_HTML = r'''
             .divine-progress { width: 180px; }
             .divine-ring { width: 160px; height: 160px; margin-top: -80px; margin-left: -80px; }
             .divine-ring:nth-child(2) { width: 220px; height: 220px; margin-top: -110px; margin-left: -110px; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .ai-summary-card, .ai-progress-panel, .ai-step, .ai-progress-fill,
+            .ai-step[data-state="active"] .ai-step-dot, .ai-skeleton-line::after {
+                animation: none; transition: none;
+            }
         }
     </style>
 </head>
@@ -843,7 +979,10 @@ INDEX_HTML = r'''
                 <div class="header-sub">八字排盘 · AI解读</div>
             </div>
         </div>
-        <div style="display:flex;align-items:center;gap:0.8rem;">
+        <div class="header-actions">
+            <button class="theme-toggle" id="themeToggle" type="button" onclick="toggleTheme()" aria-label="切换为浅色模式" title="切换为浅色模式">
+                <span class="theme-toggle-icon" aria-hidden="true"></span>
+            </button>
             <span class="user-badge" id="userBadge" onclick="showAuthModal()" style="display:none;"></span>
             <div class="quota-badge" id="quotaBadge" onclick="showAuthModal('login')">登录领5次解读</div>
         </div>
@@ -927,13 +1066,23 @@ INDEX_HTML = r'''
             <div class="ai-section">
                 <div class="ai-title">道长解读</div>
                 <button class="btn-divine" id="aiGetBtn" style="display:none; margin-bottom:1rem; padding:0.6rem; font-size:0.95rem;" onclick="getAIReading(currentResultData)">请道长开示</button>
-                <div class="ai-tabs" id="aiTabs" style="display:none;">
-                    <div class="ai-tab active" onclick="switchTab('性格', this)">性格</div>
-                    <div class="ai-tab" onclick="switchTab('财运', this)">财运</div>
-                    <div class="ai-tab" onclick="switchTab('婚姻', this)">婚姻</div>
-                    <div class="ai-tab" onclick="switchTab('健康', this)">健康</div>
-                    <div class="ai-tab" onclick="switchTab('大运', this)">大运</div>
-                    <div class="ai-tab" onclick="switchTab('总评', this)">总评</div>
+                <div class="ai-summary-card" id="aiSummaryCard" style="display:none;"></div>
+                <div class="ai-progress-panel" id="aiProgressPanel" style="display:none;" aria-live="polite">
+                    <div class="ai-status-row">
+                        <div class="ai-status-text" id="aiStatusText">正在展卷校验命盘...</div>
+                        <div class="ai-progress-percent" id="aiProgressPercent">0%</div>
+                    </div>
+                    <div class="ai-progress-track"><div class="ai-progress-fill" id="aiProgressFill"></div></div>
+                    <div class="ai-step-grid" id="aiProgressSteps"></div>
+                </div>
+                <div class="ai-quality-note" id="aiQualityNote" style="display:none;" role="status"></div>
+                <div class="ai-tabs" id="aiTabs" style="display:none;" role="tablist">
+                    <button class="ai-tab active" type="button" role="tab" aria-selected="true" onclick="switchTab('性格', this)">性格</button>
+                    <button class="ai-tab" type="button" role="tab" aria-selected="false" onclick="switchTab('财运', this)">财运</button>
+                    <button class="ai-tab" type="button" role="tab" aria-selected="false" onclick="switchTab('婚姻', this)">婚姻</button>
+                    <button class="ai-tab" type="button" role="tab" aria-selected="false" onclick="switchTab('健康', this)">健康</button>
+                    <button class="ai-tab" type="button" role="tab" aria-selected="false" onclick="switchTab('大运', this)">大运</button>
+                    <button class="ai-tab" type="button" role="tab" aria-selected="false" onclick="switchTab('总评', this)">总评</button>
                 </div>
                 <div class="ai-tab-content active" id="tab_性格"><div class="ai-content" id="ai_性格"></div></div>
                 <div class="ai-tab-content" id="tab_财运"><div class="ai-content" id="ai_财运"></div></div>
@@ -981,6 +1130,41 @@ INDEX_HTML = r'''
     </div>
 
     <script>
+        function getCurrentTheme() {
+            return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+        }
+
+        function updateThemeToggle(theme) {
+            const toggle = document.getElementById('themeToggle');
+            const metaTheme = document.querySelector('meta[name="theme-color"]');
+            const isLight = theme === 'light';
+            if (metaTheme) {
+                metaTheme.setAttribute('content', isLight ? '#f6eedf' : '#0a0a0f');
+            }
+            if (toggle) {
+                const label = isLight ? '切换为深色模式' : '切换为浅色模式';
+                toggle.setAttribute('aria-label', label);
+                toggle.setAttribute('title', label);
+            }
+        }
+
+        function setTheme(theme) {
+            const nextTheme = theme === 'light' ? 'light' : 'dark';
+            document.documentElement.dataset.theme = nextTheme;
+            try {
+                localStorage.setItem('xjg_theme', nextTheme);
+            } catch (e) {}
+            updateThemeToggle(nextTheme);
+        }
+
+        function toggleTheme() {
+            setTheme(getCurrentTheme() === 'light' ? 'dark' : 'light');
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            updateThemeToggle(getCurrentTheme());
+        });
+
         // === 客户端唯一ID（存 localStorage，跨会话稳定，不随IP变化） ===
         function getClientId() {
             let cid = localStorage.getItem('xjg_client_id');
@@ -1013,9 +1197,155 @@ INDEX_HTML = r'''
 
         // 命理典籍库（用于展示引据来源）
         const CLASSIC_BOOKS = ['滴天髓','子平真诠','穷通宝鉴','三命通会','渊海子平','神峰通考','命理约言','李虚中命书','黄金策','黄帝内经'];
+        const AI_TABS = ['性格','财运','婚姻','健康','大运','总评'];
+        const AI_WAIT_MESSAGES = [
+            '正在校验四柱与月令...',
+            '正在对照十神与藏干...',
+            '正在审当前大运落点...',
+            '正在整理六个解读板块...',
+            '正在润色为可读建议...'
+        ];
+        let aiUserSelectedTab = false;
+        let aiWaitTimer = null;
 
         function escapeHtml(s) {
             return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        function valueText(value, fallback) {
+            if (fallback === undefined) fallback = '无';
+            if (Array.isArray(value)) return value.length ? value.join('、') : fallback;
+            if (value === null || value === undefined) return fallback;
+            const text = String(value).trim();
+            return text || fallback;
+        }
+
+        function getCurrentDayun(data) {
+            if (!data || !data.solar_date || !Array.isArray(data.dayun)) return null;
+            const match = String(data.solar_date).match(/(\d+)年/);
+            if (!match) return null;
+            const currentAge = new Date().getFullYear() - parseInt(match[1], 10);
+            for (const dy of data.dayun) {
+                if (currentAge >= dy.start_age && currentAge <= dy.end_age) return dy;
+            }
+            return null;
+        }
+
+        function getTopWuxing(data) {
+            const pct = data && data.wuxing_percent ? data.wuxing_percent : {};
+            return ['金','木','水','火','土']
+                .map(wx => ({wx, value: Number(pct[wx] || 0)}))
+                .sort((a, b) => b.value - a.value)
+                .slice(0, 2)
+                .map(item => item.wx + item.value + '%')
+                .join('、') || '五行待校验';
+        }
+
+        function showAISummary(data) {
+            const el = document.getElementById('aiSummaryCard');
+            if (!el || !data) return;
+            const currentDy = getCurrentDayun(data);
+            const dayunText = currentDy ? currentDy.gan + currentDy.zhi + '运（' + currentDy.start_age + '-' + currentDy.end_age + '岁）' : '当前大运待校验';
+            const main = valueText(data.day_master) + '日主 · ' + valueText(data.shenwang) + ' · ' + valueText(data.geju) + '。本地排盘已完成，AI将围绕月令、十神、五行与' + dayunText + '展开。';
+            const pills = [
+                '五行偏向：' + getTopWuxing(data),
+                '喜用：' + valueText(data.xiyong),
+                '忌神：' + valueText(data.jishen),
+                '当前：' + dayunText
+            ];
+            el.innerHTML = '<div class="ai-summary-kicker">命盘摘要 · 先看结论脉络</div>'
+                + '<div class="ai-summary-main">' + escapeHtml(main) + '</div>'
+                + '<div class="ai-summary-pills">' + pills.map(p => '<span class="ai-summary-pill">' + escapeHtml(p) + '</span>').join('') + '</div>';
+            el.style.display = 'block';
+        }
+
+        function setAIQualityNote(message, type, details) {
+            const el = document.getElementById('aiQualityNote');
+            if (!el) return;
+            if (!message) {
+                el.style.display = 'none';
+                el.innerHTML = '';
+                return;
+            }
+            const detailList = Array.isArray(details) ? details : (details ? [details] : []);
+            const extra = detailList.length ? '<br><span>' + detailList.map(escapeHtml).join('；') + '</span>' : '';
+            el.className = 'ai-quality-note' + (type ? ' ' + type : '');
+            el.innerHTML = escapeHtml(message) + extra;
+            el.style.display = 'block';
+        }
+
+        function setAIStatus(text, percent) {
+            const statusEl = document.getElementById('aiStatusText');
+            const percentEl = document.getElementById('aiProgressPercent');
+            const fillEl = document.getElementById('aiProgressFill');
+            if (statusEl) statusEl.textContent = text;
+            if (percentEl) percentEl.textContent = Math.max(0, Math.min(100, percent)) + '%';
+            if (fillEl) fillEl.style.width = Math.max(0, Math.min(100, percent)) + '%';
+        }
+
+        function initAIProgress(tabs) {
+            const panel = document.getElementById('aiProgressPanel');
+            const steps = document.getElementById('aiProgressSteps');
+            if (!panel || !steps) return;
+            steps.innerHTML = tabs.map(t => '<div class="ai-step" data-ai-step="' + t + '" data-state="pending"><span class="ai-step-dot"></span><span>' + t + '</span></div>').join('');
+            panel.style.display = 'block';
+            setAIStatus('正在展卷校验命盘...', 6);
+        }
+
+        function updateAIProgress(tabContents, tabs, done) {
+            let currentIndex = -1;
+            for (let i = 0; i < tabs.length; i++) {
+                if (tabContents[tabs[i]] && tabContents[tabs[i]].trim()) currentIndex = i;
+            }
+            const percent = done ? 100 : Math.min(92, Math.round(((Math.max(currentIndex, 0) + (currentIndex >= 0 ? 0.45 : 0.15)) / tabs.length) * 100));
+            const activeName = currentIndex >= 0 ? tabs[currentIndex] : tabs[0];
+            tabs.forEach((t, i) => {
+                const step = document.querySelector('[data-ai-step="' + t + '"]');
+                if (!step) return;
+                const state = done || (currentIndex >= 0 && i < currentIndex) ? 'done' : (i === Math.max(currentIndex, 0) ? 'active' : 'pending');
+                step.setAttribute('data-state', state);
+            });
+            setAIStatus(done ? '六个板块已完成，正在落印归档。' : '正在推演【' + activeName + '】...', percent);
+        }
+
+        function clearAIWaitTimer() {
+            if (aiWaitTimer) {
+                clearInterval(aiWaitTimer);
+                aiWaitTimer = null;
+            }
+        }
+
+        function startAIWaitTimer() {
+            clearAIWaitTimer();
+            let idx = 0;
+            aiWaitTimer = setInterval(() => {
+                setAIStatus(AI_WAIT_MESSAGES[idx % AI_WAIT_MESSAGES.length], Math.min(88, 10 + idx * 6));
+                idx += 1;
+            }, 1500);
+        }
+
+        function getActiveAITab() {
+            const active = document.querySelector('.ai-tab.active');
+            return active ? active.textContent.trim() : '性格';
+        }
+
+        function aiPlaceholder(name) {
+            return '<div class="ai-loading-card">【' + escapeHtml(name) + '】正在等候推演...'
+                + '<div class="ai-skeleton"><div class="ai-skeleton-line"></div><div class="ai-skeleton-line" style="width:86%;"></div><div class="ai-skeleton-line" style="width:64%;"></div></div></div>';
+        }
+
+        function renderAISections(tabContents, tabs, done) {
+            const activeName = getActiveAITab();
+            tabs.forEach(t => {
+                const el = document.getElementById('ai_' + t);
+                if (!el) return;
+                const content = tabContents[t];
+                if (content) {
+                    el.innerHTML = formatInterpretation(content) + (!done && t === activeName ? '<span class="ai-cursor"></span>' : '');
+                } else {
+                    el.innerHTML = done ? '<span class="ai-waiting">此板块未生成完整内容。</span>' : aiPlaceholder(t);
+                }
+            });
         }
 
         function looksLikeCitation(seg) {
@@ -1216,9 +1546,11 @@ INDEX_HTML = r'''
                 displayResult(detail.paipan);
 
                 // 清空AI解读区，显示获取按钮
-                const tabs = ['性格','财运','婚姻','健康','大运','总评'];
+                const tabs = AI_TABS;
                 tabs.forEach(t => { document.getElementById('ai_' + t).textContent = ''; });
                 document.getElementById('aiTabs').style.display = 'none';
+                document.getElementById('aiProgressPanel').style.display = 'none';
+                setAIQualityNote('', '');
                 document.getElementById('r_ai_meta').style.display = 'none';
                 document.getElementById('r_source_tag').style.display = 'none';
                 document.getElementById('aiSeal').style.display = 'none';
@@ -1238,13 +1570,21 @@ INDEX_HTML = r'''
             const btn = document.getElementById('aiGetBtn');
             if (btn) { btn.style.display = 'none'; }
 
-            const tabs = ['性格','财运','婚姻','健康','大运','总评'];
+            const tabs = AI_TABS;
+            aiUserSelectedTab = false;
+            showAISummary(paipanData);
+            setAIQualityNote('', '');
+            initAIProgress(tabs);
+            startAIWaitTimer();
+
             tabs.forEach(t => { document.getElementById('ai_' + t).innerHTML = ''; });
             document.getElementById('r_ai_meta').style.display = 'none';
             document.getElementById('r_source_tag').style.display = 'none';
             document.getElementById('aiSeal').style.display = 'none';
             document.getElementById('aiTabs').style.display = 'flex';
-            document.getElementById('ai_性格').innerHTML = '<span class="ai-waiting">道长焚香净手，展卷研读命书...</span><span class="ai-cursor"></span>';
+            switchTab('性格', null, false);
+            let tabContents = {}; tabs.forEach(t => tabContents[t] = '');
+            renderAISections(tabContents, tabs, false);
 
             try {
                 const aiRes = await apiFetch('/api/interpret', {
@@ -1257,9 +1597,12 @@ INDEX_HTML = r'''
                     const errData = await aiRes.json();
                     if (errData.need_login) {
                         pendingAIReading = paipanData;
-                        document.getElementById('ai_性格').textContent = '登录后即可请道长开示（新用户5次免费）。';
+                        setAIQualityNote('登录后即可请道长开示，新用户有5次免费解读。', 'error');
+                        document.getElementById('ai_性格').textContent = '登录后即可继续生成。';
                         showAuthModal('login');
                     }
+                    clearAIWaitTimer();
+                    document.getElementById('aiProgressPanel').style.display = 'none';
                     updateAIGetBtn();
                     if (btn) { btn.style.display = 'block'; }
                     return;
@@ -1269,11 +1612,18 @@ INDEX_HTML = r'''
                     const errData = await aiRes.json();
                     if (errData.need_recharge) {
                         document.getElementById('rechargeModal').classList.add('active');
+                        setAIQualityNote('免费次数已用完，已生成过的命盘仍可回看。', 'error');
                         document.getElementById('ai_性格').textContent = '免费次数已用完。';
                     }
+                    clearAIWaitTimer();
+                    document.getElementById('aiProgressPanel').style.display = 'none';
                     updateAIGetBtn();
                     if (btn) { btn.style.display = 'block'; }
                     return;
+                }
+
+                if (!aiRes.ok || !aiRes.body) {
+                    throw new Error('AI服务暂时没有返回可读取的流');
                 }
 
                 // SSE流式读取
@@ -1282,7 +1632,7 @@ INDEX_HTML = r'''
                 let fullText = '';
                 let buffer = '';
                 let currentTab = '性格';
-                let tabContents = {}; tabs.forEach(t => tabContents[t] = '');
+                let hadAIError = false;
 
                 while (true) {
                     const {done, value} = await reader.read();
@@ -1297,27 +1647,30 @@ INDEX_HTML = r'''
                         try {
                             const chunk = JSON.parse(line.slice(6));
                             if (chunk.text) {
+                                clearAIWaitTimer();
                                 fullText += chunk.text;
                                 renderTabs(fullText, tabContents, tabs);
-                                let activeTab = currentTab;
-                                for (const t of tabs) {
-                                    if (tabContents[t].length > 0) activeTab = t;
-                                }
-                                if (activeTab !== currentTab) {
-                                    currentTab = activeTab;
-                                    document.querySelectorAll('.ai-tab').forEach(t => t.classList.remove('active'));
-                                    document.querySelectorAll('.ai-tab-content').forEach(c => c.classList.remove('active'));
-                                    document.querySelector('.ai-tab:nth-child(' + (tabs.indexOf(currentTab)+1) + ')').classList.add('active');
-                                    document.getElementById('tab_' + currentTab).classList.add('active');
+                                updateAIProgress(tabContents, tabs, false);
+                                currentTab = getActiveAITab();
+                                if (!aiUserSelectedTab) {
+                                    let activeTab = currentTab;
+                                    for (const t of tabs) {
+                                        if (tabContents[t].length > 0) activeTab = t;
+                                    }
+                                    if (activeTab !== currentTab) {
+                                        currentTab = activeTab;
+                                        switchTab(currentTab, null, false);
+                                    }
                                 }
                                 document.getElementById('aiTabs').style.display = 'flex';
-                                document.getElementById('ai_' + currentTab).innerHTML = formatInterpretation(tabContents[currentTab]) + '<span class="ai-cursor"></span>';
+                                renderAISections(tabContents, tabs, false);
                             }
                             if (chunk.done) {
+                                clearAIWaitTimer();
                                 renderTabs(fullText, tabContents, tabs);
-                                tabs.forEach(t => {
-                                    document.getElementById('ai_' + t).innerHTML = formatInterpretation(tabContents[t]);
-                                });
+                                updateAIProgress(tabContents, tabs, true);
+                                renderAISections(tabContents, tabs, true);
+                                setAIQualityNote(chunk.cached ? '已展开历史解读，不消耗次数。' : '解读已通过完整性校验，已为你保存。', 'success');
                                 document.getElementById('aiTabs').style.display = 'flex';
                                 document.getElementById('r_ai_meta').style.display = 'flex';
                                 // 从解读文本中提炼实际引据的典籍，作为来源展示
@@ -1332,7 +1685,11 @@ INDEX_HTML = r'''
                                 document.getElementById('aiSeal').style.display = 'flex';
                             }
                             if (chunk.error) {
-                                document.getElementById('ai_性格').textContent = '解读失败: ' + chunk.error;
+                                clearAIWaitTimer();
+                                hadAIError = true;
+                                setAIStatus('本次生成未通过，次数已保留。', 0);
+                                setAIQualityNote(chunk.error, 'error', chunk.validation_issues || []);
+                                document.getElementById('ai_性格').textContent = chunk.retryable ? '这次开示没有成文，点击按钮可重新生成。' : '解读失败: ' + chunk.error;
                                 document.getElementById('aiTabs').style.display = 'flex';
                                 if (btn) { btn.style.display = 'block'; }
                             }
@@ -1340,9 +1697,10 @@ INDEX_HTML = r'''
                     }
                 }
                 updateQuota();
-                loadHistory();  // 刷新历史列表的"已解读"标记
+                if (!hadAIError) loadHistory();  // 刷新历史列表的"已解读"标记
             } catch(e) {
-                alert('请求失败: ' + e.message);
+                clearAIWaitTimer();
+                setAIQualityNote('请求失败: ' + e.message + '。请稍后重试。', 'error');
                 if (btn) { btn.style.display = 'block'; }
             }
         }
@@ -1489,10 +1847,21 @@ INDEX_HTML = r'''
             }
         }
 
-        function switchTab(name, el) {
-            document.querySelectorAll('.ai-tab').forEach(t => t.classList.remove('active'));
+        function switchTab(name, el, userAction) {
+            if (userAction !== false) aiUserSelectedTab = true;
+            document.querySelectorAll('.ai-tab').forEach(t => {
+                t.classList.remove('active');
+                t.setAttribute('aria-selected', 'false');
+            });
             document.querySelectorAll('.ai-tab-content').forEach(c => c.classList.remove('active'));
-            if (el) el.classList.add('active');
+            if (!el) {
+                const idx = AI_TABS.indexOf(name);
+                el = idx >= 0 ? document.querySelector('.ai-tab:nth-child(' + (idx + 1) + ')') : null;
+            }
+            if (el) {
+                el.classList.add('active');
+                el.setAttribute('aria-selected', 'true');
+            }
             document.getElementById('tab_' + name).classList.add('active');
         }
 
@@ -1530,6 +1899,18 @@ INDEX_HTML = r'''
 
         function displayResult(r) {
             document.getElementById('resultSection').classList.add('active');
+            clearAIWaitTimer();
+            aiUserSelectedTab = false;
+            setAIQualityNote('', '');
+            AI_TABS.forEach(t => { document.getElementById('ai_' + t).innerHTML = ''; });
+            document.getElementById('aiTabs').style.display = 'none';
+            document.getElementById('aiProgressPanel').style.display = 'none';
+            document.getElementById('r_ai_meta').style.display = 'none';
+            document.getElementById('r_source_tag').style.display = 'none';
+            document.getElementById('aiSeal').style.display = 'none';
+            document.getElementById('aiGetBtn').style.display = 'none';
+            switchTab('性格', null, false);
+            showAISummary(r);
             const fp = r.four_pillars;
             document.getElementById('r_solar').textContent = r.solar_date;
             document.getElementById('r_lunar').textContent = r.lunar_date;

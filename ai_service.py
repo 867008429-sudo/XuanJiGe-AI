@@ -13,6 +13,7 @@ DeepSeek API调用：流式输出(SSE) + token计数 + 缓存 + 成本控制
 import os
 import json
 import hashlib
+import re
 import requests
 from flask import Response
 
@@ -31,6 +32,8 @@ PROMPT_VERSION = 'interpretation-v4-flash'
 # Token价格（美元）。不同模型/时段价格会变，生产可用环境变量覆盖。
 INPUT_PRICE_PER_M = float(os.environ.get('DEEPSEEK_INPUT_PRICE_PER_M_USD', '0.56'))
 OUTPUT_PRICE_PER_M = float(os.environ.get('DEEPSEEK_OUTPUT_PRICE_PER_M_USD', '3.78'))
+
+SECTION_NAMES = ['性格', '财运', '婚姻', '健康', '大运', '总评']
 
 
 def calc_cost(prompt_tokens, completion_tokens):
@@ -207,6 +210,71 @@ def build_payload(system_prompt, user_prompt):
     return payload
 
 
+def _current_dayun_label(paipan_data):
+    solar_date_str = paipan_data.get('solar_date', '')
+    year_match = re.search(r'(\d+)年', solar_date_str)
+    if not year_match:
+        return ''
+
+    import datetime as _dt
+    current_year = _dt.datetime.now().year
+    current_age = current_year - int(year_match.group(1))
+
+    for dy in paipan_data.get('dayun', []):
+        if current_age >= dy.get('start_age', 999) and current_age <= dy.get('end_age', -1):
+            return f"{dy.get('gan', '')}{dy.get('zhi', '')}"
+    return ''
+
+
+def validate_interpretation(text, paipan_data=None, finish_reason=None):
+    """
+    轻量质量闸门：不追求替代人工评测，只拦住明显不完整/不安全的生成结果。
+    """
+    issues = []
+    content = (text or '').strip()
+
+    if finish_reason == 'length':
+        issues.append('输出被模型截断')
+    if len(content) < 900:
+        issues.append('解读正文过短')
+
+    section_matches = list(re.finditer(r'【(性格|财运|婚姻|健康|大运|总评)】', content))
+    found_sections = [m.group(1) for m in section_matches]
+    missing_sections = [name for name in SECTION_NAMES if name not in found_sections]
+    if missing_sections:
+        issues.append('缺少板块：' + '、'.join(missing_sections))
+    elif found_sections[:len(SECTION_NAMES)] != SECTION_NAMES:
+        issues.append('六个板块顺序不正确')
+
+    sections = {}
+    for idx, match in enumerate(section_matches):
+        start = match.end()
+        end = section_matches[idx + 1].start() if idx + 1 < len(section_matches) else len(content)
+        sections[match.group(1)] = content[start:end].strip()
+
+    for name in SECTION_NAMES:
+        if name in sections and len(sections[name]) < 80:
+            issues.append(f'{name}板块内容过短')
+
+    dayun_text = sections.get('大运', '')
+    current_dayun = _current_dayun_label(paipan_data or {})
+    if dayun_text and current_dayun and current_dayun not in dayun_text and '当前大运' not in dayun_text:
+        issues.append('大运板块未明确回扣当前大运')
+
+    risky_phrases = [
+        '必定发财', '稳赚不赔', '包赚', '保证发财', '一定离婚',
+        '必然离婚', '必有大病', '诊断为', '你患有', '肯定患有',
+    ]
+    hit_risks = [phrase for phrase in risky_phrases if phrase in content]
+    if hit_risks:
+        issues.append('含绝对化或医疗化表述：' + '、'.join(hit_risks[:3]))
+
+    return {
+        'ok': len(issues) == 0,
+        'issues': issues,
+    }
+
+
 def stream_interpretation(paipan_data):
     """
     流式调用DeepSeek API，返回SSE生成器
@@ -237,6 +305,7 @@ def stream_interpretation(paipan_data):
         full_text = ''
         prompt_tokens = 0
         completion_tokens = 0
+        finish_reason = None
 
         for line in resp.iter_lines():
             if not line:
@@ -255,7 +324,9 @@ def stream_interpretation(paipan_data):
 
                 # 提取最终正文。V4思考模式可能返回 reasoning_content 或 content=None，这些不推给前端。
                 if 'choices' in chunk and chunk['choices']:
-                    delta = chunk['choices'][0].get('delta', {})
+                    choice = chunk['choices'][0]
+                    finish_reason = choice.get('finish_reason') or finish_reason
+                    delta = choice.get('delta', {})
                     text = delta.get('content')
                     if isinstance(text, str) and text:
                         full_text += text
@@ -273,6 +344,11 @@ def stream_interpretation(paipan_data):
         # 发送token统计信息
         total_tokens = prompt_tokens + completion_tokens
         cost = calc_cost(prompt_tokens, completion_tokens)
+        quality = validate_interpretation(full_text, paipan_data, finish_reason)
+
+        if not quality['ok']:
+            yield f'data: {json.dumps({"error": "这次解读生成不完整，已为你保留次数，请重新开示。", "retryable": True, "validation_issues": quality["issues"]}, ensure_ascii=False)}\n\n'
+            return
 
         meta = {
             'done': True,
@@ -280,6 +356,8 @@ def stream_interpretation(paipan_data):
             'completion_tokens': completion_tokens,
             'total_tokens': total_tokens,
             'cost_usd': cost,
+            'finish_reason': finish_reason,
+            'quality': quality,
             'full_text': full_text  # 用于缓存
         }
         yield f'data: {json.dumps(meta, ensure_ascii=False)}\n\n'
