@@ -1928,7 +1928,8 @@ INDEX_HTML = r'''
             if (!wheel) return;
             const selected = wheel.querySelector('.birth-wheel-item.is-selected');
             if (!selected) return;
-            const top = selected.offsetTop - (wheel.clientHeight - selected.offsetHeight) / 2;
+            const relativeTop = selected.offsetTop - wheel.offsetTop;
+            const top = relativeTop - (wheel.clientHeight - selected.offsetHeight) / 2;
             clearTimeout(birthWheelScrollLocks[key]);
             birthWheelScrollLocks[key] = setTimeout(() => {
                 birthWheelScrollLocks[key] = null;
@@ -1960,7 +1961,7 @@ INDEX_HTML = r'''
                 let nearest = null;
                 let nearestDist = Infinity;
                 wheel.querySelectorAll('.birth-wheel-item').forEach(item => {
-                    const itemCenter = item.offsetTop + item.offsetHeight / 2;
+                    const itemCenter = item.offsetTop - wheel.offsetTop + item.offsetHeight / 2;
                     const dist = Math.abs(itemCenter - center);
                     if (dist < nearestDist) {
                         nearestDist = dist;
