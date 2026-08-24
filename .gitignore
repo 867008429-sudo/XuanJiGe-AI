@@ -16,3 +16,6 @@ venv/
 .screenshots/
 .uploads/
 *.log
+
+# 私人项目接管笔记（仅本地保留）
+docs/PROJECT_GUIDE.md

@@ -5,8 +5,6 @@
 
 **在线 Demo**：http://129.204.102.108:8888
 
-**项目接管手册**：[docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md) - 项目介绍、技术栈、AI 调用、部署运维、安全风控与学习路线
-
 ![首页](docs/screenshot-landing.png)
 
 ## 功能特性
