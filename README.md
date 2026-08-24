@@ -20,6 +20,8 @@
 
 ![解读效果](docs/screenshot-interpretation.png)
 
+![完整结果](docs/screenshot-complete.png)
+
 ---
 
 ## 1. 架构说明
