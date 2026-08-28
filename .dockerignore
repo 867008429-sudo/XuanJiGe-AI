@@ -4,6 +4,5 @@ __pycache__/
 .env
 .uploads/
 .git/
-.gitignore
 *.md
 docker-compose.yml
