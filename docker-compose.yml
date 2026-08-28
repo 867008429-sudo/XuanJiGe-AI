@@ -11,6 +11,8 @@ services:
       - .env
     volumes:
       - db-data:/app/data
+      - backup-data:/app/backups
+      - log-data:/app/logs
       - ./app.py:/app/app.py
       - ./bazi_engine.py:/app/bazi_engine.py
       - ./ai_service.py:/app/ai_service.py
@@ -23,3 +25,5 @@ services:
 
 volumes:
   db-data:
+  backup-data:
+  log-data:

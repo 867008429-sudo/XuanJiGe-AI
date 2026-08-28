@@ -8,6 +8,7 @@ import os
 import json
 import secrets
 from datetime import datetime, timedelta
+from werkzeug.security import check_password_hash, generate_password_hash
 
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(__file__), 'xuanjige.db'))
 
@@ -107,6 +108,22 @@ def init_db():
             ON registration_attempts(ip, created_at);
         CREATE INDEX IF NOT EXISTS idx_registration_attempts_client_time
             ON registration_attempts(client_id, created_at);
+
+        -- 体验码表：用于邀请制注册和防止单个体验码无限复用
+        CREATE TABLE IF NOT EXISTS invite_codes (
+            code TEXT PRIMARY KEY NOT NULL,
+            max_uses INTEGER DEFAULT 1,
+            used_count INTEGER DEFAULT 0,
+            disabled INTEGER DEFAULT 0,
+            note TEXT DEFAULT '',
+            used_by_account_id INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            used_at TEXT,
+            FOREIGN KEY (used_by_account_id) REFERENCES accounts(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_invite_codes_state
+            ON invite_codes(disabled, used_count, max_uses);
     ''')
     db.commit()
     db.close()
@@ -334,7 +351,14 @@ def delete_history(history_id, fingerprint):
 def get_stats():
     """获取系统统计（用于管理后台）"""
     db = get_db()
+    since_24h = "-1 day"
     total_users = db.execute('SELECT COUNT(*) as c FROM users').fetchone()['c']
+    total_accounts = db.execute('SELECT COUNT(*) as c FROM accounts').fetchone()['c']
+    total_history = db.execute('SELECT COUNT(*) as c FROM history').fetchone()['c']
+    interpreted_history = db.execute(
+        'SELECT COUNT(*) as c FROM history WHERE has_ai = 1'
+    ).fetchone()['c']
+    total_cache_items = db.execute('SELECT COUNT(*) as c FROM ai_cache').fetchone()['c']
     total_requests = db.execute('SELECT COUNT(*) as c FROM usage_logs').fetchone()['c']
     cache_hits = db.execute(
         'SELECT COUNT(*) as c FROM usage_logs WHERE cache_hit = 1'
@@ -345,14 +369,70 @@ def get_stats():
     total_cost = db.execute(
         'SELECT COALESCE(SUM(cost_usd), 0) as s FROM usage_logs'
     ).fetchone()['s']
+    ai_24h = db.execute(
+        '''SELECT COUNT(*) AS requests,
+                  COALESCE(SUM(tokens_used), 0) AS tokens,
+                  COALESCE(SUM(cost_usd), 0) AS cost,
+                  SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) AS cache_hits
+           FROM usage_logs
+           WHERE endpoint = '/api/interpret'
+             AND created_at >= datetime('now', ?)''',
+        (since_24h,)
+    ).fetchone()
+    accounts_24h = db.execute(
+        "SELECT COUNT(*) AS c FROM accounts WHERE created_at >= datetime('now', ?)",
+        (since_24h,)
+    ).fetchone()['c']
+    registrations_24h = db.execute(
+        '''SELECT COUNT(*) AS attempts,
+                  SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes,
+                  SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures
+           FROM registration_attempts
+           WHERE created_at >= datetime('now', ?)''',
+        (since_24h,)
+    ).fetchone()
+    recent_failure_reasons = db.execute(
+        '''SELECT reason, COUNT(*) AS count
+           FROM registration_attempts
+           WHERE success = 0
+             AND created_at >= datetime('now', ?)
+           GROUP BY reason
+           ORDER BY count DESC
+           LIMIT 5''',
+        (since_24h,)
+    ).fetchall()
     db.close()
+    ai_24h_requests = ai_24h['requests'] or 0
+    ai_24h_cache_hits = ai_24h['cache_hits'] or 0
+    invite_stats = get_invite_code_stats()
     return {
         'total_users': total_users,
+        'total_accounts': total_accounts,
+        'total_history': total_history,
+        'interpreted_history': interpreted_history,
+        'total_cache_items': total_cache_items,
         'total_requests': total_requests,
         'cache_hits': cache_hits,
         'cache_rate': f"{cache_hits}/{total_requests}" if total_requests > 0 else "0/0",
+        'cache_rate_percent': round(cache_hits / total_requests * 100, 1) if total_requests else 0,
         'total_tokens': total_tokens,
         'total_cost_usd': round(total_cost, 4),
+        'invite_codes': invite_stats,
+        'last_24h': {
+            'accounts_created': accounts_24h,
+            'ai_requests': ai_24h_requests,
+            'ai_tokens': ai_24h['tokens'] or 0,
+            'ai_cost_usd': round(ai_24h['cost'] or 0, 4),
+            'cache_hits': ai_24h_cache_hits,
+            'cache_rate_percent': round(ai_24h_cache_hits / ai_24h_requests * 100, 1) if ai_24h_requests else 0,
+            'registration_attempts': registrations_24h['attempts'] or 0,
+            'registration_successes': registrations_24h['successes'] or 0,
+            'registration_failures': registrations_24h['failures'] or 0,
+            'top_registration_failure_reasons': [
+                {'reason': row['reason'] or 'unknown', 'count': row['count']}
+                for row in recent_failure_reasons
+            ],
+        },
     }
 
 
@@ -435,13 +515,125 @@ def check_registration_gate(
 # ==================== 账号系统 ====================
 
 def hash_password(password):
-    """密码哈希"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """生成带盐密码哈希。"""
+    return generate_password_hash(password)
 
 
-def register(username, password):
+def verify_password(password, stored_hash):
+    """校验新式 Werkzeug 哈希，并兼容早期 SHA256 账号。"""
+    if not stored_hash:
+        return False
+    if stored_hash.startswith(('scrypt:', 'pbkdf2:')):
+        return check_password_hash(stored_hash, password)
+    legacy = hashlib.sha256(password.encode()).hexdigest()
+    return secrets.compare_digest(stored_hash, legacy)
+
+
+def seed_invite_codes(codes, max_uses=1, note=''):
+    """批量写入体验码；重复 code 会被忽略。"""
+    cleaned = []
+    for code in codes:
+        text = (code or '').strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    if not cleaned:
+        return 0
+    max_uses = max(1, int(max_uses or 1))
+    db = get_db()
+    before = db.total_changes
+    db.executemany(
+        '''INSERT OR IGNORE INTO invite_codes (code, max_uses, note)
+           VALUES (?, ?, ?)''',
+        [(code, max_uses, (note or '')[:120]) for code in cleaned]
+    )
+    inserted = db.total_changes - before
+    db.commit()
+    db.close()
+    return inserted
+
+
+def has_invite_codes():
+    """是否配置过数据库体验码；即使用完也仍要求体验码。"""
+    db = get_db()
+    count = db.execute('SELECT COUNT(*) AS c FROM invite_codes').fetchone()['c']
+    db.close()
+    return count > 0
+
+
+def has_available_invite_codes():
+    """是否存在仍可使用的数据库体验码。"""
+    db = get_db()
+    count = db.execute(
+        '''SELECT COUNT(*) AS c
+           FROM invite_codes
+           WHERE disabled = 0 AND used_count < max_uses'''
+    ).fetchone()['c']
+    db.close()
+    return count > 0
+
+
+def is_invite_code_available(code):
+    """检查单个数据库体验码是否可用。"""
+    code = (code or '').strip()
+    if not code:
+        return False
+    db = get_db()
+    row = db.execute(
+        '''SELECT code
+           FROM invite_codes
+           WHERE code = ?
+             AND disabled = 0
+             AND used_count < max_uses''',
+        (code,)
+    ).fetchone()
+    db.close()
+    return row is not None
+
+
+def disable_invite_codes(codes):
+    """禁用一批体验码，返回实际命中的数量。"""
+    cleaned = []
+    for code in codes:
+        text = (code or '').strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    if not cleaned:
+        return 0
+    db = get_db()
+    before = db.total_changes
+    db.executemany(
+        'UPDATE invite_codes SET disabled = 1 WHERE code = ?',
+        [(code,) for code in cleaned]
+    )
+    changed = db.total_changes - before
+    db.commit()
+    db.close()
+    return changed
+
+
+def get_invite_code_stats():
+    """体验码运营统计。"""
+    db = get_db()
+    row = db.execute(
+        '''SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN disabled = 0 AND used_count < max_uses THEN 1 ELSE 0 END) AS available,
+                  SUM(CASE WHEN used_count >= max_uses THEN 1 ELSE 0 END) AS used_up,
+                  SUM(CASE WHEN disabled = 1 THEN 1 ELSE 0 END) AS disabled
+           FROM invite_codes'''
+    ).fetchone()
+    db.close()
+    return {
+        'total': row['total'] or 0,
+        'available': row['available'] or 0,
+        'used_up': row['used_up'] or 0,
+        'disabled': row['disabled'] or 0,
+    }
+
+
+def register(username, password, invite_code=None):
     """注册新账号，返回 (token, error)"""
     db = get_db()
+    invite_code = (invite_code or '').strip()
     # 检查用户名是否已存在
     existing = db.execute('SELECT id FROM accounts WHERE username = ?', (username,)).fetchone()
     if existing:
@@ -454,6 +646,18 @@ def register(username, password):
     if len(password) < 4:
         db.close()
         return None, '密码至少4个字符'
+    if invite_code:
+        invite = db.execute(
+            '''SELECT code
+               FROM invite_codes
+               WHERE code = ?
+                 AND disabled = 0
+                 AND used_count < max_uses''',
+            (invite_code,)
+        ).fetchone()
+        if not invite:
+            db.close()
+            return None, '体验码已被使用或不存在'
     # 创建账号
     pw_hash = hash_password(password)
     cursor = db.execute(
@@ -468,6 +672,15 @@ def register(username, password):
         'INSERT INTO sessions (token, account_id, fingerprint, expires_at) VALUES (?, ?, ?, ?)',
         (token, account_id, fingerprint, (datetime.now() + timedelta(days=365)).isoformat())
     )
+    if invite_code:
+        db.execute(
+            '''UPDATE invite_codes
+               SET used_count = used_count + 1,
+                   used_at = datetime('now'),
+                   used_by_account_id = ?
+               WHERE code = ?''',
+            (account_id, invite_code)
+        )
     db.commit()
     db.close()
     return token, None
@@ -477,10 +690,10 @@ def login(username, password):
     """登录，返回 (token, error)"""
     db = get_db()
     account = db.execute(
-        'SELECT * FROM accounts WHERE username = ? AND password_hash = ?',
-        (username, hash_password(password))
+        'SELECT * FROM accounts WHERE username = ?',
+        (username,)
     ).fetchone()
-    if not account:
+    if not account or not verify_password(password, account['password_hash']):
         db.close()
         return None, '用户名或密码错误'
     token = secrets.token_hex(24)
@@ -489,6 +702,11 @@ def login(username, password):
         'INSERT INTO sessions (token, account_id, fingerprint, expires_at) VALUES (?, ?, ?, ?)',
         (token, account['id'], fingerprint, (datetime.now() + timedelta(days=365)).isoformat())
     )
+    if not account['password_hash'].startswith(('scrypt:', 'pbkdf2:')):
+        db.execute(
+            'UPDATE accounts SET password_hash = ? WHERE id = ?',
+            (hash_password(password), account['id'])
+        )
     db.commit()
     db.close()
     return token, None

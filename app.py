@@ -16,11 +16,14 @@
   # 或 Docker: docker build -t xuanjige . && docker run -p 8888:8888 xuanjige
 """
 
-from flask import Flask, request, jsonify, Response, make_response
+from flask import Flask, request, jsonify, Response, make_response, g
 from flask_cors import CORS
 import os
 import json
 import time as _time
+import hmac
+import logging
+from pathlib import Path
 
 def _load_env_fallback(path='.env'):
     """Load simple KEY=VALUE pairs when python-dotenv is unavailable."""
@@ -47,14 +50,16 @@ import db
 import ai_service
 from bazi_engine import paipan
 
-app = Flask(__name__)
-CORS(app)
-
 
 def _csv_env(name):
     """Read comma-separated env values without leaking secrets into the page."""
     raw = os.environ.get(name, '')
     return [item.strip() for item in raw.split(',') if item.strip()]
+
+
+ALLOWED_ORIGINS = _csv_env('ALLOWED_ORIGINS') or '*'
+app = Flask(__name__)
+CORS(app, origins=ALLOWED_ORIGINS)
 
 
 REGISTRATION_INVITE_CODES = (
@@ -65,6 +70,48 @@ REGISTRATION_RATE_WINDOW_MINUTES = int(os.environ.get('REGISTRATION_RATE_WINDOW_
 REGISTRATION_RATE_MAX_ATTEMPTS = int(os.environ.get('REGISTRATION_RATE_MAX_ATTEMPTS', '8'))
 REGISTRATION_DAILY_MAX_PER_IP = int(os.environ.get('REGISTRATION_DAILY_MAX_PER_IP', '2'))
 REGISTRATION_DAILY_MAX_PER_CLIENT = int(os.environ.get('REGISTRATION_DAILY_MAX_PER_CLIENT', '1'))
+ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '').strip()
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+LOG_FILE = os.environ.get('LOG_FILE', '').strip()
+
+
+def configure_logging():
+    handlers = [logging.StreamHandler()]
+    if LOG_FILE:
+        log_path = Path(LOG_FILE)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding='utf-8'))
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format='%(asctime)s %(levelname)s %(name)s %(message)s',
+        handlers=handlers,
+        force=True,
+    )
+
+
+configure_logging()
+logger = logging.getLogger('xuanjige.app')
+SECURITY_HEADERS = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'same-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+}
+
+
+def registration_invite_required():
+    """Whether registration should ask for an invite code."""
+    return bool(REGISTRATION_INVITE_CODES) or db.has_invite_codes()
+
+
+def resolve_invite_code_source(invite_code):
+    """Return env/db source for an invite code, or empty string when invalid."""
+    code = (invite_code or '').strip()
+    if db.has_invite_codes():
+        return 'db' if db.is_invite_code_available(code) else ''
+    if REGISTRATION_INVITE_CODES and code in REGISTRATION_INVITE_CODES:
+        return 'env'
+    return ''
 
 
 # ==================== 用户指纹辅助 ====================
@@ -88,6 +135,18 @@ def get_client_ip(req):
     if forwarded:
         return forwarded.split(',')[0].strip()
     return req.remote_addr or 'unknown'
+
+
+def is_admin_request(req):
+    """Validate admin-only endpoints without exposing the configured token."""
+    if not ADMIN_TOKEN:
+        return False
+    token = req.headers.get('X-Admin-Token', '').strip()
+    if not token:
+        auth = req.headers.get('Authorization', '').strip()
+        if auth.lower().startswith('bearer '):
+            token = auth[7:].strip()
+    return bool(token and hmac.compare_digest(token, ADMIN_TOKEN))
 
 
 def _client_fingerprint(req):
@@ -129,6 +188,71 @@ def get_fingerprint(req):
     return db.get_fingerprint(ip, ua)
 
 
+
+def build_runtime_checks(port=None):
+    """Return non-secret runtime checks for health and startup diagnostics."""
+    checks = []
+    try:
+        resolved_port = int(port if port is not None else os.environ.get('PORT', 8888))
+        port_ok = 1 <= resolved_port <= 65535
+    except (TypeError, ValueError):
+        resolved_port = os.environ.get('PORT', '')
+        port_ok = False
+
+    db_path = Path(db.DB_PATH)
+    db_dir = db_path.parent
+    checks.append({'name': 'deepseek_api_key', 'ok': bool(ai_service.DEEPSEEK_API_KEY), 'required': False})
+    checks.append({'name': 'deepseek_model', 'ok': bool(ai_service.DEEPSEEK_MODEL), 'required': True, 'value': ai_service.DEEPSEEK_MODEL})
+    checks.append({'name': 'structured_generation', 'ok': True, 'required': False, 'enabled': bool(ai_service.STRUCTURED_GENERATION_ENABLED)})
+    checks.append({
+        'name': 'database_path',
+        'ok': db_dir.exists() and os.access(db_dir, os.W_OK),
+        'required': True,
+        'filename': db_path.name,
+        'parent_writable': db_dir.exists() and os.access(db_dir, os.W_OK),
+    })
+    checks.append({'name': 'admin_stats', 'ok': bool(ADMIN_TOKEN), 'required': False, 'enabled': bool(ADMIN_TOKEN)})
+    checks.append({'name': 'port', 'ok': port_ok, 'required': True, 'value': resolved_port})
+    critical_ok = all(item['ok'] for item in checks if item.get('required'))
+    return {
+        'status': 'ok' if critical_ok else 'degraded',
+        'checks': checks,
+    }
+
+
+def log_startup_checks(port=None, debug=False):
+    report = build_runtime_checks(port)
+    logger.info('startup service=xuanjige status=%s debug=%s', report['status'], debug)
+    for item in report['checks']:
+        log = logger.info if item['ok'] or not item.get('required') else logger.error
+        safe_meta = {k: v for k, v in item.items() if k not in ('ok', 'required')}
+        log('startup_check name=%s ok=%s required=%s meta=%s', item['name'], item['ok'], item.get('required'), safe_meta)
+    return report
+
+
+@app.before_request
+def _start_request_timer():
+    g.request_started_at = _time.perf_counter()
+
+
+@app.after_request
+def _log_request(response):
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    started = getattr(g, 'request_started_at', None)
+    duration_ms = int((_time.perf_counter() - started) * 1000) if started else -1
+    level = logging.DEBUG if request.path == '/health' else logging.INFO
+    logger.log(
+        level,
+        'request method=%s path=%s status=%s duration_ms=%s ip=%s',
+        request.method,
+        request.path,
+        response.status_code,
+        duration_ms,
+        get_client_ip(request),
+    )
+    return response
+
 # ==================== 页面路由 ====================
 
 @app.route('/')
@@ -146,12 +270,14 @@ def index():
 @app.route('/health')
 def health():
     """健康检查端点（用于负载均衡/Docker健康检查）"""
+    report = build_runtime_checks()
     return jsonify({
-        'status': 'ok',
+        'status': report['status'],
         'service': 'xuanjige',
         'version': '1.0.0',
-        'ai_enabled': bool(ai_service.DEEPSEEK_API_KEY)
-    })
+        'ai_enabled': bool(ai_service.DEEPSEEK_API_KEY),
+        'checks': report['checks'],
+    }), 200 if report['status'] == 'ok' else 503
 
 
 @app.route('/api/paipan', methods=['POST'])
@@ -402,7 +528,7 @@ def api_quota():
 def api_auth_config():
     """Expose safe auth UX flags without exposing invite codes."""
     return jsonify({
-        'invite_required': bool(REGISTRATION_INVITE_CODES),
+        'invite_required': registration_invite_required(),
     })
 
 
@@ -429,11 +555,18 @@ def api_register():
         db.record_registration_attempt(client_ip, client_id, username, False, gate_error)
         return jsonify({'error': gate_error}), 429
 
-    if REGISTRATION_INVITE_CODES and invite_code not in REGISTRATION_INVITE_CODES:
-        db.record_registration_attempt(client_ip, client_id, username, False, '邀请码错误')
-        return jsonify({'error': '体验码不正确，请确认后再注册'}), 403
+    invite_source = ''
+    if registration_invite_required():
+        invite_source = resolve_invite_code_source(invite_code)
+        if not invite_source:
+            db.record_registration_attempt(client_ip, client_id, username, False, '邀请码错误')
+            return jsonify({'error': '体验码不正确，请确认后再注册'}), 403
 
-    token, error = db.register(username, password)
+    token, error = db.register(
+        username,
+        password,
+        invite_code=invite_code if invite_source == 'db' else None,
+    )
     if error:
         db.record_registration_attempt(client_ip, client_id, username, False, error)
         return jsonify({'error': error}), 400
@@ -506,6 +639,10 @@ def api_me():
 @app.route('/api/stats', methods=['GET'])
 def api_stats():
     """系统统计（管理用）"""
+    if not ADMIN_TOKEN:
+        return jsonify({'error': '管理统计未启用'}), 404
+    if not is_admin_request(request):
+        return jsonify({'error': '没有权限'}), 403
     return jsonify(db.get_stats())
 
 
@@ -544,11 +681,12 @@ INDEX_HTML = r'''
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="theme-color" content="#0a0a0f">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>玄机阁 · 八字排盘</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0a0f'/%3E%3Ccircle cx='32' cy='32' r='20' fill='none' stroke='%23d4af37' stroke-width='4'/%3E%3Cpath d='M32 12a20 20 0 0 1 0 40 10 10 0 0 0 0-20 10 10 0 0 1 0-20Z' fill='%23d4af37'/%3E%3Ccircle cx='32' cy='22' r='4' fill='%230a0a0f'/%3E%3Ccircle cx='32' cy='42' r='4' fill='%23d4af37'/%3E%3C/svg%3E">
     <script>
         (function() {
             try {
@@ -987,6 +1125,57 @@ INDEX_HTML = r'''
         }
         .ai-quality-note.error { border-color: var(--red-border); background: var(--red-tint); color: var(--red-bright); }
         .ai-quality-note.success { color: var(--gold-bright); }
+        .ai-report-map {
+            margin: 0 0 1rem; padding: 0.85rem; border: 1px solid var(--gold-border);
+            border-radius: 12px; background: linear-gradient(135deg, var(--bg-card-hover), var(--gold-tint));
+            animation: ai-rise 0.32s cubic-bezier(.2,.85,.25,1) both;
+        }
+        .ai-report-head {
+            display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+            margin-bottom: 0.7rem; color: var(--gold-bright); font-size: 0.9rem; font-weight: 700;
+        }
+        .ai-report-head span { color: var(--text-dim); font-size: 0.74rem; font-weight: 400; }
+        .ai-report-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.55rem; }
+        .ai-report-card {
+            min-height: 76px; padding: 0.65rem; border: 1px solid var(--border); border-radius: 10px;
+            background: var(--bg-card); color: var(--text-dim); text-align: left; cursor: pointer;
+            font-family: inherit; transition: transform 0.22s ease, border-color 0.22s ease, background 0.22s ease, color 0.22s ease;
+        }
+        .ai-report-card:hover, .ai-report-card.active {
+            transform: translateY(-1px); border-color: var(--gold-border); background: var(--gold-tint); color: var(--text);
+        }
+        .ai-report-card[data-state="done"] { color: var(--gold-bright); }
+        .ai-report-card-name { display: flex; align-items: center; gap: 0.35rem; font-size: 0.84rem; font-weight: 700; }
+        .ai-report-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); flex: 0 0 auto; }
+        .ai-report-card[data-state="active"] .ai-report-dot { background: var(--gold-bright); animation: ai-pulse 1.35s ease-in-out infinite; }
+        .ai-report-card[data-state="done"] .ai-report-dot { background: var(--green); }
+        .ai-report-excerpt {
+            margin-top: 0.35rem; font-size: 0.75rem; line-height: 1.55; color: var(--text-dim);
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+        }
+        .ai-insight-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.65rem; margin-bottom: 0.85rem; }
+        .ai-insight-card {
+            padding: 0.65rem; border: 1px solid var(--border); border-radius: 10px;
+            background: var(--gold-tint); transition: border-color 0.22s ease, background 0.22s ease;
+        }
+        .ai-insight-label { display: block; margin-bottom: 0.28rem; color: var(--text-dim); font-size: 0.72rem; }
+        .ai-insight-value { color: var(--gold-bright); font-size: 0.82rem; line-height: 1.65; }
+        .ai-report-actions {
+            display: none; align-items: center; justify-content: space-between; gap: 0.75rem;
+            margin-top: 1rem; padding: 0.78rem 0.85rem; border: 1px solid var(--border);
+            border-radius: 10px; background: var(--bg-card); animation: ai-rise 0.3s cubic-bezier(.2,.85,.25,1) both;
+        }
+        .ai-trust-note {
+            flex: 1 1 240px; color: var(--text-dim); font-size: 0.78rem; line-height: 1.65;
+        }
+        .ai-share-btn {
+            min-height: 38px; padding: 0.45rem 0.75rem; border: 1px solid var(--gold-border);
+            border-radius: 999px; background: var(--gold-tint); color: var(--gold-bright);
+            font-family: inherit; font-size: 0.8rem; cursor: pointer;
+            transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+        }
+        .ai-share-btn:hover { transform: translateY(-1px); background: var(--gold-tint-strong); }
+        .ai-share-btn:disabled { opacity: 0.65; cursor: default; transform: none; }
         .ai-loading-card { color: var(--text-dim); font-size: 0.86rem; line-height: 1.7; }
         .ai-skeleton { display: grid; gap: 0.5rem; margin-top: 0.65rem; }
         .ai-skeleton-line {
@@ -1268,6 +1457,11 @@ INDEX_HTML = r'''
             .birth-wheel-label { font-size: 0.68rem; }
             .birth-wheel-item { font-size: 0.88rem; }
             .birth-picker-value { font-size: 0.95rem; }
+            .ai-step-grid, .ai-report-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .ai-insight-grid { grid-template-columns: 1fr; }
+            .ai-report-card { min-height: 68px; padding: 0.58rem; }
+            .ai-report-actions { align-items: stretch; }
+            .ai-share-btn { width: 100%; }
             .dao-sigil { width: 225px; opacity: 0.24; }
             .dao-sigil-a { left: -102px; top: 112px; }
             .dao-sigil-b { right: -106px; bottom: 32px; }
@@ -1284,10 +1478,15 @@ INDEX_HTML = r'''
             }
             .auth-overlay.active .auth-modal-card { transform: translateY(0) scale(1); }
         }
+        @media (max-width: 380px) {
+            .ai-report-grid { grid-template-columns: 1fr; }
+        }
         @keyframes birth-sheet-up { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
         @media (prefers-reduced-motion: reduce) {
             .ai-summary-card, .ai-progress-panel, .ai-step, .ai-progress-fill,
-            .ai-step[data-state="active"] .ai-step-dot, .ai-skeleton-line::after,
+            .ai-step[data-state="active"] .ai-step-dot, .ai-report-map, .ai-report-card,
+            .ai-report-card[data-state="active"] .ai-report-dot, .ai-insight-card,
+            .ai-report-actions, .ai-share-btn, .ai-skeleton-line::after,
             .birth-picker-trigger, .birth-picker-sheet, .birth-wheel-item,
             .modal-overlay, .modal, .auth-flow,
             body::before, body::after,
@@ -1432,6 +1631,7 @@ INDEX_HTML = r'''
                     <div class="ai-step-grid" id="aiProgressSteps"></div>
                 </div>
                 <div class="ai-quality-note" id="aiQualityNote" style="display:none;" role="status"></div>
+                <div class="ai-report-map" id="aiReportMap" style="display:none;" aria-label="AI报告总览"></div>
                 <div class="ai-tabs" id="aiTabs" style="display:none;" role="tablist">
                     <button class="ai-tab active" type="button" role="tab" aria-selected="true" onclick="switchTab('性格', this)">性格</button>
                     <button class="ai-tab" type="button" role="tab" aria-selected="false" onclick="switchTab('财运', this)">财运</button>
@@ -1446,6 +1646,10 @@ INDEX_HTML = r'''
                 <div class="ai-tab-content" id="tab_健康"><div class="ai-content" id="ai_健康"></div></div>
                 <div class="ai-tab-content" id="tab_大运"><div class="ai-content" id="ai_大运"></div></div>
                 <div class="ai-tab-content" id="tab_总评"><div class="ai-content" id="ai_总评"></div></div>
+                <div class="ai-report-actions" id="aiReportActions">
+                    <div class="ai-trust-note">解读基于本地排盘、十神五行与大运上下文生成，仅作传统文化与自我观察参考，不替代医疗、投资或重大人生决策。</div>
+                    <button class="ai-share-btn" id="aiShareBtn" type="button" onclick="copyAIShareSummary()">复制分享摘要</button>
+                </div>
                 <div class="ai-seal" id="aiSeal">玄机<br>阁印</div>
                 <div class="ai-meta" id="r_ai_meta" style="display:none;">
                     <div class="ai-meta-item" id="r_source_tag" style="display:none;">引据典籍: <span></span></div>
@@ -1598,6 +1802,9 @@ INDEX_HTML = r'''
         ];
         let aiUserSelectedTab = false;
         let aiWaitTimer = null;
+        let latestAITabContents = {};
+        let latestAIDone = false;
+        let latestAIText = '';
 
         function escapeHtml(s) {
             return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1725,18 +1932,197 @@ INDEX_HTML = r'''
                 + '<div class="ai-skeleton"><div class="ai-skeleton-line"></div><div class="ai-skeleton-line" style="width:86%;"></div><div class="ai-skeleton-line" style="width:64%;"></div></div></div>';
         }
 
+        function uniqueList(list) {
+            const seen = new Set();
+            return list.filter(item => {
+                const key = String(item || '').trim();
+                if (!key || seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+        }
+
+        function cleanAISentence(text) {
+            return String(text || '')
+                .replace(/——[^。！？]*[。！？]?/g, '')
+                .replace(/\s+/g, '')
+                .trim();
+        }
+
+        function pickAISentence(content, matcher) {
+            const sentences = cleanAISentence(content).split(/[。！？]/).map(s => s.trim()).filter(Boolean);
+            const picked = matcher ? sentences.find(s => matcher.test(s)) : sentences[0];
+            if (!picked) return '';
+            return picked.length > 72 ? picked.slice(0, 72) + '...' : picked + '。';
+        }
+
+        function getEvidenceCandidates(data) {
+            if (!data) return [];
+            const items = [];
+            const fp = data.four_pillars || {};
+            const currentDy = getCurrentDayun(data);
+            const push = (label, value) => {
+                const text = valueText(value, '');
+                if (text && text !== '无') items.push(label + '：' + text);
+            };
+            push('日主', valueText(data.day_master, '') + valueText(data.day_master_wuxing, ''));
+            push('格局', data.geju);
+            push('旺弱', data.shenwang);
+            if (currentDy) push('当前大运', currentDy.gan + currentDy.zhi);
+            for (const key of ['year', 'month', 'day', 'hour']) {
+                const p = fp[key];
+                if (p) push(p.gan + p.zhi, [p.gan_shishen, p.zhi_shishen].filter(Boolean).join(' / '));
+            }
+            push('喜用', data.xiyong);
+            push('忌神', data.jishen);
+            return uniqueList(items);
+        }
+
+        function pickEvidence(content, data) {
+            const candidates = getEvidenceCandidates(data);
+            const found = candidates.filter(item => {
+                const term = item.split('：')[1] || item;
+                return term.length >= 2 && String(content || '').indexOf(term) !== -1;
+            });
+            return uniqueList(found.concat(candidates)).slice(0, 3);
+        }
+
+        function renderAIInsightPanel(name, content) {
+            const evidence = pickEvidence(content, currentResultData);
+            const mapping = pickAISentence(content, /适合|容易|表现|现实|工作|关系|压力|节奏|选择/);
+            const advice = pickAISentence(content, /建议|可以|需要|宜|少|避免|先|不要/);
+            const fallback = {
+                '性格': '先看日主、月令与十神组合。',
+                '财运': '先看财星、食伤与喜忌。',
+                '婚姻': '先看日支、财官与冲合。',
+                '健康': '先看五行偏枯，只作养生提醒。',
+                '大运': '先看当前大运，再看未来趋势。',
+                '总评': '先收束命格主线与行动建议。'
+            }[name] || '继续读取正文细节。';
+            return '<div class="ai-insight-grid">'
+                + '<div class="ai-insight-card"><span class="ai-insight-label">盘面依据</span><div class="ai-insight-value">' + evidence.map(escapeHtml).join('<br>') + '</div></div>'
+                + '<div class="ai-insight-card"><span class="ai-insight-label">现实映射</span><div class="ai-insight-value">' + escapeHtml(mapping || pickAISentence(content) || fallback) + '</div></div>'
+                + '<div class="ai-insight-card"><span class="ai-insight-label">行动建议</span><div class="ai-insight-value">' + escapeHtml(advice || fallback) + '</div></div>'
+                + '</div>';
+        }
+
+        function updateAIReportMap(tabContents, tabs, done) {
+            const el = document.getElementById('aiReportMap');
+            if (!el) return;
+            const activeName = getActiveAITab();
+            const completeCount = tabs.filter(t => tabContents[t] && tabContents[t].trim().length > 40).length;
+            el.innerHTML = '<div class="ai-report-head">读盘总览<span>' + completeCount + '/' + tabs.length + (done ? ' 已落印' : ' 正在生成') + '</span></div>'
+                + '<div class="ai-report-grid">'
+                + tabs.map(t => {
+                    const content = tabContents[t] || '';
+                    const state = done || content.trim().length > 40 ? 'done' : (t === activeName ? 'active' : 'pending');
+                    const active = t === activeName ? ' active' : '';
+                    const excerpt = pickAISentence(content) || '等待道长推演此板块。';
+                    return '<button type="button" class="ai-report-card' + active + '" data-tab="' + t + '" data-state="' + state + '" aria-label="查看' + t + '解读" onclick="switchTab(this.dataset.tab, null)">'
+                        + '<div class="ai-report-card-name"><span class="ai-report-dot"></span>' + t + '</div>'
+                        + '<div class="ai-report-excerpt">' + escapeHtml(excerpt) + '</div>'
+                        + '</button>';
+                }).join('')
+                + '</div>';
+            el.style.display = 'block';
+        }
+
+        function setAIReportActionsVisible(visible) {
+            const actions = document.getElementById('aiReportActions');
+            const shareBtn = document.getElementById('aiShareBtn');
+            if (!actions) return;
+            actions.style.display = visible ? 'flex' : 'none';
+            if (!visible && shareBtn) {
+                shareBtn.disabled = false;
+                shareBtn.textContent = '复制分享摘要';
+            }
+        }
+
+        function buildAIShareSummary() {
+            const data = currentResultData || {};
+            const currentDy = getCurrentDayun(data);
+            const fp = data.four_pillars || {};
+            const pillarText = ['year','month','day','hour']
+                .map(key => fp[key] ? fp[key].gan + fp[key].zhi : '')
+                .filter(Boolean)
+                .join(' ');
+            const lines = [
+                '玄机阁 AI 命盘摘要',
+                '公历：' + valueText(data.solar_date, '待校验'),
+                '四柱：' + (pillarText || '待校验'),
+                '日主：' + valueText(data.day_master, '待校验') + valueText(data.day_master_wuxing, ''),
+                '格局：' + valueText(data.geju, '待校验') + '；旺弱：' + valueText(data.shenwang, '待校验'),
+                currentDy ? '当前大运：' + currentDy.gan + currentDy.zhi + '（' + currentDy.start_age + '-' + currentDy.end_age + '岁）' : '当前大运：待校验',
+                ''
+            ];
+            AI_TABS.forEach(t => {
+                const sentence = pickAISentence(latestAITabContents[t] || '');
+                if (sentence) lines.push('【' + t + '】' + sentence);
+            });
+            if (!AI_TABS.some(t => latestAITabContents[t])) {
+                lines.push(cleanAISentence(latestAIText).slice(0, 180) || '解读正在生成中。');
+            }
+            lines.push('');
+            lines.push('注：本摘要仅作传统文化与自我观察参考，不替代医疗、投资或重大人生决策。');
+            return lines.join('\n');
+        }
+
+        function fallbackCopyText(text) {
+            const temp = document.createElement('textarea');
+            temp.value = text;
+            temp.setAttribute('readonly', '');
+            temp.style.position = 'fixed';
+            temp.style.left = '-9999px';
+            document.body.appendChild(temp);
+            temp.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(temp);
+            if (!ok) throw new Error('clipboard unavailable');
+        }
+
+        async function copyAIShareSummary() {
+            const btn = document.getElementById('aiShareBtn');
+            const text = buildAIShareSummary();
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = '正在复制...';
+            }
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                } else {
+                    fallbackCopyText(text);
+                }
+                if (btn) btn.textContent = '已复制';
+            } catch(e) {
+                if (btn) btn.textContent = '复制失败，请手动选择';
+                setAIQualityNote('浏览器限制了剪贴板权限，你可以直接选择正文复制。', 'error');
+            } finally {
+                window.setTimeout(() => {
+                    if (!btn) return;
+                    btn.disabled = false;
+                    btn.textContent = '复制分享摘要';
+                }, 1500);
+            }
+        }
+
         function renderAISections(tabContents, tabs, done) {
+            latestAITabContents = Object.assign({}, tabContents);
+            latestAIDone = !!done;
+            latestAIText = tabs.map(t => tabContents[t] || '').filter(Boolean).join('\n\n');
             const activeName = getActiveAITab();
             tabs.forEach(t => {
                 const el = document.getElementById('ai_' + t);
                 if (!el) return;
                 const content = tabContents[t];
                 if (content) {
-                    el.innerHTML = formatInterpretation(content) + (!done && t === activeName ? '<span class="ai-cursor"></span>' : '');
+                    el.innerHTML = renderAIInsightPanel(t, content) + formatInterpretation(content) + (!done && t === activeName ? '<span class="ai-cursor"></span>' : '');
                 } else {
                     el.innerHTML = done ? '<span class="ai-waiting">此板块未生成完整内容。</span>' : aiPlaceholder(t);
                 }
             });
+            updateAIReportMap(tabContents, tabs, done);
+            setAIReportActionsVisible(!!done && tabs.some(t => tabContents[t] && tabContents[t].trim().length > 40));
         }
 
         function looksLikeCitation(seg) {
@@ -1995,6 +2381,12 @@ INDEX_HTML = r'''
                 tabs.forEach(t => { document.getElementById('ai_' + t).textContent = ''; });
                 document.getElementById('aiTabs').style.display = 'none';
                 document.getElementById('aiProgressPanel').style.display = 'none';
+                document.getElementById('aiReportMap').style.display = 'none';
+                document.getElementById('aiReportMap').innerHTML = '';
+                latestAITabContents = {};
+                latestAIDone = false;
+                latestAIText = '';
+                setAIReportActionsVisible(false);
                 setAIQualityNote('', '');
                 document.getElementById('r_ai_meta').style.display = 'none';
                 document.getElementById('r_source_tag').style.display = 'none';
@@ -2017,6 +2409,10 @@ INDEX_HTML = r'''
 
             const tabs = AI_TABS;
             aiUserSelectedTab = false;
+            latestAITabContents = {};
+            latestAIDone = false;
+            latestAIText = '';
+            setAIReportActionsVisible(false);
             showAISummary(paipanData);
             setAIQualityNote('', '');
             initAIProgress(tabs);
@@ -2136,6 +2532,7 @@ INDEX_HTML = r'''
                             if (chunk.error) {
                                 clearAIWaitTimer();
                                 hadAIError = true;
+                                setAIReportActionsVisible(false);
                                 setAIStatus('本次生成未通过，次数已保留。', 0);
                                 setAIQualityNote(chunk.error, 'error', chunk.validation_issues || []);
                                 document.getElementById('ai_性格').textContent = chunk.retryable ? '这次开示没有成文，点击按钮可重新生成。' : '解读失败: ' + chunk.error;
@@ -2149,6 +2546,7 @@ INDEX_HTML = r'''
                 if (!hadAIError) loadHistory();  // 刷新历史列表的"已解读"标记
             } catch(e) {
                 clearAIWaitTimer();
+                setAIReportActionsVisible(false);
                 setAIQualityNote('请求失败: ' + e.message + '。请稍后重试。', 'error');
                 if (btn) { btn.style.display = 'block'; }
             }
@@ -2593,6 +2991,10 @@ INDEX_HTML = r'''
                 el.setAttribute('aria-selected', 'true');
             }
             document.getElementById('tab_' + name).classList.add('active');
+            const reportMap = document.getElementById('aiReportMap');
+            if (reportMap && reportMap.style.display !== 'none') {
+                updateAIReportMap(latestAITabContents, AI_TABS, latestAIDone);
+            }
         }
 
         function renderTabs(text, tabContents, tabs) {
@@ -2628,6 +3030,7 @@ INDEX_HTML = r'''
         }
 
         function displayResult(r) {
+            currentResultData = r;
             document.getElementById('resultSection').classList.add('active');
             clearAIWaitTimer();
             aiUserSelectedTab = false;
@@ -2635,6 +3038,12 @@ INDEX_HTML = r'''
             AI_TABS.forEach(t => { document.getElementById('ai_' + t).innerHTML = ''; });
             document.getElementById('aiTabs').style.display = 'none';
             document.getElementById('aiProgressPanel').style.display = 'none';
+            document.getElementById('aiReportMap').style.display = 'none';
+            document.getElementById('aiReportMap').innerHTML = '';
+            latestAITabContents = {};
+            latestAIDone = false;
+            latestAIText = '';
+            setAIReportActionsVisible(false);
             document.getElementById('r_ai_meta').style.display = 'none';
             document.getElementById('r_source_tag').style.display = 'none';
             document.getElementById('aiSeal').style.display = 'none';
@@ -2704,11 +3113,7 @@ INDEX_HTML = r'''
 '''
 
 if __name__ == '__main__':
-    import os
     port = int(os.environ.get('PORT', 8888))
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'
-    print('玄机阁启动中...')
-    print(f'DeepSeek API Key: {"已配置" if ai_service.DEEPSEEK_API_KEY else "未配置（AI解读不可用，排盘正常）"}')
-    print(f'数据库: {db.DB_PATH}')
-    print(f'模式: {"开发(debug)" if debug else "生产"}')
+    log_startup_checks(port, debug)
     app.run(host='0.0.0.0', port=port, debug=debug)

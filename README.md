@@ -3,7 +3,7 @@
 > 天文历法精确排盘 + DeepSeek 大模型流式解读的命理 Web 应用
 > 一个"计算与生成分离"的 AI First 小型全栈 Demo
 
-**在线 Demo**：http://129.204.102.108:8888
+**在线 Demo**：部署后建议绑定域名并启用 HTTPS，例如 `https://your-domain.com`
 
 ![首页](docs/screenshot-landing.png)
 
@@ -14,6 +14,7 @@
 - **账号体系**：注册/登录，新用户 5 次免费 AI 解读；同一命盘二次查看走缓存，**永远不重复扣费**
 - **历史记录**：按账号隔离，访客排过的盘在注册后自动迁移到账号名下
 - **成本可控**：单次解读 token 用量与成本可统计，缓存命中为 ¥0
+- **运营统计**：`/api/stats` 默认关闭，配置 `ADMIN_TOKEN` 后可查看账号、缓存、24h AI 成本与注册失败原因
 - **零依赖部署**：SQLite 单文件数据库，Docker Compose 一条命令上线
 
 ![解读效果](docs/screenshot-interpretation.png)
@@ -39,7 +40,7 @@
 │  /api/register   /api/login   /api/logout  账号体系   │
 │  /api/quota      /api/me     配额与会话查询           │
 │  /api/history    /api/history/<id>   历史记录         │
-│  /health         /api/stats  健康检查与统计            │
+│  /health         /api/stats  健康检查与管理统计         │
 └───────┬────────────────────────┬─────────────────────┘
         │                        │
 ┌───────▼────────┐    ┌──────────▼─────────────────────┐
@@ -66,7 +67,13 @@
 | `app.py` | 主入口：Flask 路由 + 内嵌前端页面（HTML/CSS/JS 单文件交付） |
 | `bazi_engine.py` | 八字排盘核心算法：历法转换、四柱、十神、格局、大运、神煞 |
 | `db.py` | SQLite 数据层：账号、会话、配额、缓存、历史、用量日志 |
-| `ai_service.py` | AI 服务层：Prompt 构建、DeepSeek 流式调用、缓存、成本计算 |
+| `ai_context.py` | 命盘上下文层：把排盘结果整理成稳定 schema，标记当前年龄与当前大运 |
+| `bazi_knowledge.py` | 轻量知识库：十神、旺衰、五行偏枯、地支关系和古籍义理白名单 |
+| `ai_prompts.py` | Prompt 层：集中管理前置规范、结构化骨架生成和最终正文生成约束 |
+| `ai_client.py` | 模型客户端层：DeepSeek/OpenAI 兼容请求、参数校验、流式解析和有限重试 |
+| `ai_validator.py` | 质量闸门：检查板块完整性、盘面证据、风险表达和输出长度 |
+| `ai_service.py` | AI 编排层：串联 context/prompt/client/validator，处理缓存、成本和 SSE 输出 |
+| `tests/` `tools/` | 单元测试与 20 个固定命盘样本预检脚本 |
 | `Dockerfile` | 生产镜像（gunicorn + gevent，支持 SSE 长连接） |
 | `docker-compose.yml` | 一键部署 + 数据卷持久化 + 健康检查 |
 
@@ -124,7 +131,7 @@ AI 只负责**非确定性的表达**（解读、比喻、古籍引用）。
 格式要求：
 1. 只输出正文，不要寒暄，不要markdown，不要编号列表。
 2. 必须严格按这六个板块输出且顺序不变：【性格】【财运】【婚姻】【健康】【大运】【总评】。
-3. 每个板块3-5段，每段2-4句；每个板块末尾用2句"——书名云：短句/义理"格式引用不同古籍。
+3. 每个板块3-5段，每段2-4句；每个板块末尾可用1句"——书名云：义理转述"点题，书名必须来自知识库片段。
 4. 总字数控制在2600-3800字，宁可少而准，不要为了字数重复。
 ```
 
@@ -137,6 +144,7 @@ AI 只负责**非确定性的表达**（解读、比喻、古籍引用）。
 | 财运/婚姻/健康/大运分场景规则 | 针对最容易空泛的板块写死分析抓手 |
 | 禁 markdown + 【】分板块 | 输出可直接按板块切 Tab 展示，前端零解析成本 |
 | "——古籍云：…"固定格式 | 前端用正则识别引用行，渲染成金色引用块 + 汇总"引据典籍" |
+| 轻量知识库白名单 | Prompt 只注入命中的十神/五行/格局/冲合义理，禁止编造古籍原文和卷页 |
 | Prompt版本 + 模型策略进入缓存 key | 升级 Prompt 或模型后自动避开旧的低质量缓存 |
 
 ### 2.2 User Prompt（结构化喂料 + 当前大运标记）
@@ -170,7 +178,13 @@ AI 只负责**非确定性的表达**（解读、比喻、古籍引用）。
 - **`← 当前大运` 标记 + 当前年龄**：解决早期版本"AI 把 43-52 岁大运当成当下"的问题——模型不知道"现在"是哪年，必须显式告知
 - **补充藏干/纳音/支神/五行占比**：把模型最容易漏看的“证据”前置，减少只看天干十神就下结论的问题
 
-### 2.3 Vibe 思路：我怎么和 AI 结对，把一个兴趣做成上线产品
+### 2.3 轻量知识库（先规则表，不急着 RAG）
+
+`bazi_knowledge.py` 会根据命盘上下文选择少量可引用片段，例如身弱取用、伤官格、当前大运十神、五行偏旺/偏弱、地支刑冲合害。Prompt 中只给模型这些命中的义理卡片，并明确：**这些不是逐字古籍原文，只能转述义理，不得编造卷页、作者信息或不存在的书名。**
+
+这样做的原因是：当前 Demo 的内容量还不需要向量数据库，直接上 RAG 会增加部署和评测复杂度。先用规则知识表能快速提升稳定性，也方便用 20 个固定样本评估每次 Prompt/知识库升级是否真的变好。
+
+### 2.4 Vibe 思路：我怎么和 AI 结对，把一个兴趣做成上线产品
 
 选"八字解读"这个题材，本身就来自我对命理/占卜类产品的长期兴趣——想验证一件事：**一个人 + AI，能不能在几天内跑通"想法 → 可用产品 → 部署上线"的完整闭环。** 答案是可以，这个 Demo 就是证明。
 
@@ -187,7 +201,7 @@ AI 只负责**非确定性的表达**（解读、比喻、古籍引用）。
 
 ```
 自然语言反馈（含精确现象）→ AI 定位根因（读代码而非猜）
-→ 修复 + 自动补测试 → 回归全量测试（64 项 API + 13 项前端单测）
+→ 修复 + 自动补测试 → 单元测试 + 20 样本评测 + 浏览器烟测
 → 浏览器端到端验证 → 部署上线 → 线上真实链路冒烟
 ```
 
@@ -279,6 +293,18 @@ cache_key = SHA256(账号指纹)[:32] + ':' + MD5(prompt版本 + 模型 + thinki
 | Prompt升级免费刷新 | 旧版缓存存在但新版缓存不存在时，免费生成新版解读并写入新缓存 |
 | AI 调用失败不扣配额 | 配额在流式成功结束后才落库，失败路径零消耗 |
 | 新用户 5 次免费 | 注册即得，配额状态实时显示在顶部徽章 |
+| 数据库体验码 | 可生成一次性或多次使用体验码，注册成功后同事务消耗，管理员统计可看剩余量 |
+
+```bash
+# 生成 100 个一次性体验码并写入当前 DB
+python tools/manage_invite_codes.py generate 100
+
+# 查看体验码总量、可用数、已用完数
+python tools/manage_invite_codes.py stats
+
+# 禁用泄露或发错的体验码
+python tools/manage_invite_codes.py disable XJG-ABCD1234
+```
 
 ### 3.4 成本控制实测
 
@@ -312,19 +338,31 @@ cd xuanjige
 # 2. 配置环境变量
 cp .env.example .env
 vi .env
-# 填入 DEEPSEEK_API_KEY=sk-xxxxxxxx
+# 填入 DEEPSEEK_API_KEY=<your-deepseek-api-key>
 # 默认模型为 deepseek-v4-flash；文字输出默认关闭thinking，流式更快
 # DEEPSEEK_MODEL=deepseek-v4-flash
 # DEEPSEEK_THINKING=0
 # DEEPSEEK_MAX_TOKENS=6000
+# DEEPSEEK_MAX_RETRIES=1
+# DEEPSEEK_STRUCTURE_REPAIR_RETRIES=2
+# ADMIN_TOKEN=replace-with-a-long-random-admin-token
+# LOG_LEVEL=INFO
+# ALLOWED_ORIGINS=https://your-domain.com
+# BACKUP_DIR=/app/backups
 
-# 3. 启动（首次会自动构建镜像）
+# 3. 上线前预检
+python tools/preflight.py
+
+# 4. 启动（首次会自动构建镜像）
 docker compose up -d
 
-# 4. 查看日志 / 验证
+# 5. 查看日志 / 验证
 docker compose logs -f
 curl http://127.0.0.1:8888/health
-# {"status":"ok","ai_enabled":true}
+# {"status":"ok","ai_enabled":true,"checks":[...]}
+
+# 6. 备份 SQLite 数据库（可放入 crontab 每日执行）
+docker compose exec xuanjige python tools/backup_sqlite.py
 
 # 更新代码后
 git pull && docker compose up -d --build
@@ -338,9 +376,9 @@ git pull && docker compose up -d --build
 
 | 记录类型 | 主机记录 | 记录值 | 说明 |
 |----------|----------|--------|------|
-| A | `@` | `129.204.102.108` | 根域名 → 服务器 IP |
-| A | `www` | `129.204.102.108` | www 子域 |
-| A | `sm` | `129.204.102.108` | （可选）子域名，如 sm.yourdomain.com |
+| A | `@` | `your-server-ip` | 根域名 → 服务器 IP |
+| A | `www` | `your-server-ip` | www 子域 |
+| A | `sm` | `your-server-ip` | （可选）子域名，如 sm.yourdomain.com |
 
 生效后 `ping your-domain.com` 返回服务器 IP 即解析成功。
 
@@ -399,17 +437,17 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo certbot renew --dry-run
 ```
 
-> 没有域名也能跑：直接用 `http://服务器IP:8888` 访问（即当前 Demo 的形态）。
+> 没有域名也能跑：直接用 `http://your-server-ip:8888` 访问；正式展示建议尽快切到域名 + HTTPS。
 > 云服务器需在安全组放行 80/443/8888 端口。
 
 ### 4.5 更新与回滚
 
 ```bash
-# 代码热更新（compose 里代码文件是卷挂载，重启即生效）
-git pull && docker compose restart
+# 更新代码并重建镜像
+git pull && python tools/preflight.py && docker compose up -d --build
 
-# 回滚到上一个版本
-git reset --hard HEAD~1 && docker compose restart
+# 回滚建议先确认 git log，必要时 checkout 到明确版本后重建
+git log --oneline -5
 ```
 
 ### 4.6 安全清单
@@ -417,6 +455,10 @@ git reset --hard HEAD~1 && docker compose restart
 - `.env`（API Key）已在 `.gitignore` 中，**切勿提交到仓库**
 - 数据库文件 `*.db` 不入库，生产数据在 Docker 卷 `db-data` 中
 - `FLASK_DEBUG=0`（生产默认）
+- `/api/stats` 默认关闭；生产环境配置 `ADMIN_TOKEN` 后必须通过 `X-Admin-Token` 或 Bearer Token 访问
+- `/health` 只暴露非敏感运行状态，不返回 API Key 或服务器绝对路径
+- 有正式域名后配置 `ALLOWED_ORIGINS`，把 API 跨域来源收紧到自己的域名
+- 新账号密码使用 Werkzeug 带盐哈希；早期 SHA256 账号在登录成功后自动升级
 - 建议上 HTTPS 后再对外开放注册，登录态走 HttpOnly Cookie + Bearer Token 双通道
 
 ---
@@ -430,7 +472,8 @@ git reset --hard HEAD~1 && docker compose restart
 | `/api/register` `/api/login` `/api/logout` | POST | 账号体系 | 否 |
 | `/api/quota` `/api/me` | GET | 配额 / 会话查询 | 否 |
 | `/api/history` `/api/history/<id>` | GET/DELETE | 历史记录（账号隔离） | 否 |
-| `/health` `/api/stats` | GET | 健康检查 / 用量统计 | 否 |
+| `/health` | GET | 健康检查 | 否 |
+| `/api/stats` | GET | 管理统计（需 `ADMIN_TOKEN`） | 否 |
 
 ## 技术栈
 
@@ -442,6 +485,17 @@ git reset --hard HEAD~1 && docker compose restart
 | AI | DeepSeek V4 Flash Chat Completions | 中文长文本输出、SSE流式体验和成本控制更适合Demo验证 |
 | 数据 | SQLite | 单文件零运维，Demo 场景最优解 |
 | 部署 | Docker Compose | 一条命令，健康检查自愈 |
+
+## 后续路线
+
+| 方向 | 计划 | 价值 |
+|------|------|------|
+| 结构化报告 JSON | 将结构化骨架中的 `summary/evidence/advice/risk` 直接返回给前端 | 减少从长文解析的脆弱性，让报告卡片更稳定 |
+| Admin 可视化 | 在受保护后台展示注册、调用、缓存、成本、失败原因和体验码状态 | 从 Demo 变成可运营产品，方便小范围真实验证 |
+| 评测样本扩容 | 从 20 个固定样本扩展到 50-100 个典型命盘，比较 Prompt 版本效果 | 避免靠主观感觉调 Prompt，让 AI 质量可回归 |
+| 报告长图/分享页 | 生成隐私脱敏的报告长图或只读分享链接 | 提高传播感，也能作为作品集展示素材 |
+| 知识库升级 | 继续扩充可追溯命理知识片段，评测稳定后再考虑轻量 RAG | 提升专业感，同时控制古籍引用幻觉 |
+| 域名与 HTTPS | 正式对外试用时绑定域名、启用证书，并收紧 CORS 白名单 | 提升信任、安全和访问专业度 |
 
 ## License
 

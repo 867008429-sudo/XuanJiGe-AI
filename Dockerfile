@@ -7,9 +7,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# 数据库持久化目录
-RUN mkdir -p /app/data
+# 数据库、备份、日志持久化目录
+RUN mkdir -p /app/data /app/backups /app/logs
 ENV DB_PATH=/app/data/xuanjige.db
+ENV BACKUP_DIR=/app/backups
 
 ENV DEEPSEEK_API_KEY=""
 ENV PORT=8888

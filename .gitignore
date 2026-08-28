@@ -4,6 +4,7 @@
 # 数据库
 *.db
 *.db-journal
+backups/
 
 # Python
 __pycache__/
@@ -19,3 +20,6 @@ venv/
 
 # 私人项目接管笔记（仅本地保留）
 docs/PROJECT_GUIDE.md
+
+# 本地规划文件
+.planning/
