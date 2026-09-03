@@ -12,11 +12,22 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(__file__), 'xuanjige.db'))
 
+# chat 链路配置（agent-plan.md v4.1 §2.1/§4.7；香火计量 persona-plan.md §3）
+# 语义：每个命盘（hid）N 炷免费香火；1 炷 = flash 档短回复的均值成本锚点。
+# used 列从"条数"改记"炷数"，缺省人格（清虚 2 炷/问）下与旧"5 次追问"等价。
+CHAT_FREE_INCENSE = int(os.environ.get('CHAT_FREE_INCENSE', '10'))
+DB_BUSY_TIMEOUT_MS = int(os.environ.get('DB_BUSY_TIMEOUT_MS', '5000'))
+
 
 def get_db():
-    """获取数据库连接"""
-    db = sqlite3.connect(DB_PATH)
+    """获取数据库连接
+
+    busy_timeout 是 spike 3 的结论性配置：gunicorn 2 worker 场景下，
+    无该参数的并发写会确定性报 database is locked；WAL + 5000ms 等待实测通过。
+    """
+    db = sqlite3.connect(DB_PATH, timeout=DB_BUSY_TIMEOUT_MS / 1000.0)
     db.row_factory = sqlite3.Row
+    db.execute(f'PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}')
     return db
 
 
@@ -124,7 +135,67 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_invite_codes_state
             ON invite_codes(disabled, used_count, max_uses);
+
+        -- 对话追问配额表（每盘 N 炷香火，used 记炷数，persona-plan.md §3）
+        CREATE TABLE IF NOT EXISTS chat_followups (
+            hid INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            used INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (hid, fingerprint)
+        );
+
+        -- 对话幂等表：同 (thread, request_id) 命中直接回放，不进图不扣额度（agent-plan §5）
+        -- price/persona 记录该次实扣与所请教道长（断线重放的账目依据，persona-plan §3.1）
+        CREATE TABLE IF NOT EXISTS chat_requests (
+            thread_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            reply_text TEXT NOT NULL,
+            quota_left INTEGER DEFAULT 0,
+            price INTEGER NOT NULL DEFAULT 2,
+            persona TEXT NOT NULL DEFAULT 'qingxu',
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (thread_id, request_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_requests_thread
+            ON chat_requests(thread_id, created_at);
     ''')
+    # persona-plan §3.2：条数→炷数存量迁移（幂等）。
+    # 标记 = chat_requests.price 列：新库建表自带该列直接跳过。
+    # 原子性：必须显式 BEGIN IMMEDIATE——SQLite 本身 ALTER 是事务性的，
+    # 但 Python sqlite3 隐式模式下 DDL 会自动提交，若不加显式事务，
+    # 崩溃在"加列已提交、换算未提交"之间会留下错账且标记已存在、永不重试。
+    # 并发竞态（gunicorn 2 worker 同时 init_db）：败者的 ALTER 撞
+    # duplicate column 抛 OperationalError，回滚后复查标记，存在即跳过。
+    _cols = {row[1] for row in db.execute('PRAGMA table_info(chat_requests)')}
+    if 'price' not in _cols:
+        try:
+            db.isolation_level = None  # 手动事务模式
+            db.execute('BEGIN IMMEDIATE')  # 抢写锁：与并发迁移者串行化
+            db.execute(
+                'ALTER TABLE chat_requests ADD COLUMN price INTEGER NOT NULL DEFAULT 2'
+            )
+            db.execute(
+                "ALTER TABLE chat_requests ADD COLUMN persona TEXT NOT NULL DEFAULT 'qingxu'"
+            )
+            # 换算自洽：旧 1 条追问 ≈ 缺省道长 2 炷；used=3 条 → 6 炷，
+            # 剩 4 炷 = 还能问 2 次，与迁移前"剩 2 次"的可用量等价
+            db.execute('UPDATE chat_followups SET used = used * 2')
+            db.execute('UPDATE chat_requests SET quota_left = quota_left * 2')
+            db.execute('COMMIT')
+        except sqlite3.OperationalError:
+            try:
+                db.execute('ROLLBACK')
+            except sqlite3.OperationalError:
+                pass  # 事务未开启（BEGIN 即失败）或已结束
+            _cols2 = {row[1] for row in db.execute('PRAGMA table_info(chat_requests)')}
+            if 'price' not in _cols2:
+                raise
+        finally:
+            db.isolation_level = ''  # 恢复隐式模式（get_db 语义不变）
+    # WAL 是 spike 3 结论：多 worker 并发写下读写不互斥（journal_mode 是库级持久属性）
+    db.execute('PRAGMA journal_mode = WAL')
     db.commit()
     db.close()
 
@@ -246,7 +317,11 @@ def log_usage(fingerprint, endpoint, cache_hit, tokens_used, cost_usd):
 
 
 def save_history(fingerprint, name, gender, solar_date, paipan_json, has_ai=False):
-    """保存排盘历史"""
+    """保存排盘历史（同人同生辰只保留一条），返回该记录的 hid。
+
+    chat 追问链路以 hid 定位命盘，排盘落库后立即回传 id（api_paipan
+    → history_id），前端据此建立会话，无需再查列表。
+    """
     db = get_db()
     # 同一个人同样的生辰只保留一条（更新即可）
     existing = db.execute(
@@ -259,23 +334,31 @@ def save_history(fingerprint, name, gender, solar_date, paipan_json, has_ai=Fals
                WHERE id = ?''',
             (name, paipan_json, has_ai, existing['id'])
         )
+        hid = existing['id']
     else:
-        db.execute(
+        cur = db.execute(
             '''INSERT INTO history (fingerprint, name, gender, solar_date, paipan_json, has_ai)
                VALUES (?, ?, ?, ?, ?, ?)''',
             (fingerprint, name, gender, solar_date, paipan_json, has_ai)
         )
+        hid = cur.lastrowid
     db.commit()
     db.close()
+    return hid
 
 
 def get_history(fingerprint):
-    """获取用户排盘历史"""
+    """获取用户排盘历史（最新优先）。
+
+    created_at 只有秒级精度，同一秒内的多条记录会并列；
+    用 id DESC 作次级排序保证"后插入的排前面"是确定性的，
+    否则同一秒连排两个盘时历史列表顺序会错乱。
+    """
     db = get_db()
     rows = db.execute(
         '''SELECT id, name, gender, solar_date, has_ai, created_at
            FROM history WHERE fingerprint = ?
-           ORDER BY created_at DESC''',
+           ORDER BY created_at DESC, id DESC''',
         (fingerprint,)
     ).fetchall()
     db.close()
@@ -790,6 +873,165 @@ def consume_quota_account(token, is_free):
         )
     db.commit()
     db.close()
+
+
+# ==================== chat 链路（agent-plan v4.1 §2.1/§5） ====================
+
+def build_chat_thread_id(fingerprint, hid):
+    """会话粒度：账号指纹 + 命盘 id。服务端拼接，客户端不可注入（§4.5）。"""
+    return f'{fingerprint}:{hid}'
+
+
+def consume_chat_quota(hid, fingerprint, price, limit=None):
+    """gate 时原子扣减 price 炷香火（persona-plan §3.1）。
+
+    UPDATE 的 WHERE used + price <= limit 条件使"检查+扣减"成为一条原子语句，
+    多进程并发下不可能双花（spike 3 的防双花结论对任意 price 成立）。
+    price 来自人格注册表白名单（≥1）；非法值属编程错误，抛错不静默。
+    返回 (是否成功, 扣减后已用炷数)。
+    """
+    limit = CHAT_FREE_INCENSE if limit is None else limit
+    price = int(price)
+    if price < 1:
+        raise ValueError(f'香火定价必须 ≥ 1，收到 {price!r}')
+    db = get_db()
+    try:
+        db.execute(
+            'INSERT OR IGNORE INTO chat_followups (hid, fingerprint, used) VALUES (?, ?, 0)',
+            (hid, fingerprint)
+        )
+        cur = db.execute(
+            '''UPDATE chat_followups SET used = used + ?
+               WHERE hid = ? AND fingerprint = ? AND used + ? <= ?''',
+            (price, hid, fingerprint, price, limit)
+        )
+        ok = cur.rowcount == 1
+        # 同事务内读取（提交前），返回值即本次扣减结果，不受并发后续写影响
+        used = db.execute(
+            'SELECT used FROM chat_followups WHERE hid = ? AND fingerprint = ?',
+            (hid, fingerprint)
+        ).fetchone()['used']
+        db.commit()
+        return ok, used
+    finally:
+        db.close()
+
+
+def refund_chat_quota(hid, fingerprint, price):
+    """失败退款：按实扣退 price 炷（唯一调用点在 /api/chat 异常分支）。
+
+    used >= price 守卫：重复退款或超额退款返回 False，
+    保证 used 不会因退款而被透支成负数。
+    """
+    price = int(price)
+    if price < 1:
+        raise ValueError(f'退款香火必须 ≥ 1，收到 {price!r}')
+    db = get_db()
+    try:
+        cur = db.execute(
+            '''UPDATE chat_followups SET used = used - ?
+               WHERE hid = ? AND fingerprint = ? AND used >= ?''',
+            (price, hid, fingerprint, price)
+        )
+        db.commit()
+        return cur.rowcount == 1
+    finally:
+        db.close()
+
+
+def get_chat_quota_left(hid, fingerprint, limit=None):
+    """剩余香火（炷数）。"""
+    limit = CHAT_FREE_INCENSE if limit is None else limit
+    db = get_db()
+    try:
+        row = db.execute(
+            'SELECT used FROM chat_followups WHERE hid = ? AND fingerprint = ?',
+            (hid, fingerprint)
+        ).fetchone()
+        used = row['used'] if row else 0
+        return max(0, limit - used)
+    finally:
+        db.close()
+
+
+def save_chat_reply(thread_id, request_id, reply_text, quota_left, price, persona):
+    """落幂等表：首次写入后不再覆盖（INSERT OR IGNORE）。
+
+    语义约定：同一 (thread_id, request_id) 的回复只落一次库；
+    之后重发一律走 get_chat_reply 回放，绝不改写历史回复。
+    price/persona 记录本次实扣与所请教道长（回放事件的账目依据）。
+    """
+    db = get_db()
+    try:
+        db.execute(
+            '''INSERT OR IGNORE INTO chat_requests
+               (thread_id, request_id, reply_text, quota_left, price, persona)
+               VALUES (?, ?, ?, ?, ?, ?)''',
+            (thread_id, request_id, reply_text, quota_left, price, persona)
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_chat_reply(thread_id, request_id):
+    """查幂等命中：返回 dict（含 price/persona）或 None（None = 未见过该 request_id）。"""
+    db = get_db()
+    try:
+        row = db.execute(
+            '''SELECT reply_text, quota_left, price, persona, created_at
+               FROM chat_requests WHERE thread_id = ? AND request_id = ?''',
+            (thread_id, request_id)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        db.close()
+
+
+def get_last_chat_persona(thread_id):
+    """该 thread 最近一次落账的道长（/api/chat/personas 的 current 标注依据）。
+
+    表是复合主键 (thread_id, request_id)、无自增 id，但 rowid 表的隐式
+    rowid 随插入单调递增，"最近一条"用它排序即可。
+    无任何对话记录返回 None，路由层回落缺省人格。
+    幂等表只记成功回答的请求，失败退款不落账——所以"最近落账"即
+    "最近一次真实请教的道长"，与用户心智一致。
+    """
+    db = get_db()
+    try:
+        row = db.execute(
+            '''SELECT persona FROM chat_requests
+               WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1''',
+            (thread_id,)
+        ).fetchone()
+        return row['persona'] if row else None
+    finally:
+        db.close()
+
+
+def delete_chat_cascade(fingerprint, hid):
+    """删盘级联：清掉该命盘的追问额度行，并按精确 thread_id 删除对话幂等记录。
+
+    当前会话模型 thread_id == fingerprint:hid（一盘一会话），精确匹配即完整级联；
+    checkpoint 线程由调用方（/api/history DELETE）另行删除。
+    生辰数据是隐私敏感信息，删了盘却留着完整对话是合规问题（§5 P0）。
+    返回删除的总行数。
+    """
+    thread_id = build_chat_thread_id(fingerprint, hid)
+    db = get_db()
+    try:
+        c1 = db.execute(
+            'DELETE FROM chat_followups WHERE hid = ? AND fingerprint = ?',
+            (hid, fingerprint)
+        ).rowcount
+        c2 = db.execute(
+            'DELETE FROM chat_requests WHERE thread_id = ?',
+            (thread_id,)
+        ).rowcount
+        db.commit()
+        return c1 + c2
+    finally:
+        db.close()
 
 
 # 初始化

@@ -1,9 +1,11 @@
 # 环境与密钥（绝不入库）
 .env
 
-# 数据库
+# 数据库（含 WAL 模式的伴生文件）
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 backups/
 
 # Python

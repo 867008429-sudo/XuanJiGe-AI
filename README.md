@@ -11,8 +11,9 @@
 
 - **精确排盘**：基于寿星天文历（sxtwl），公历转农历、节气换月令精确到分钟，四柱/十神/五行/神煞/大运全量计算
 - **AI 流式解读**：DeepSeek V4 Flash 逐字流式输出（SSE），证据驱动 Prompt 要求每个判断回扣月令、十神、藏干、五行、冲合与当前大运
+- **多轮追问（Agent）**：看完解读后可对命盘连续追问（LangGraph 工具调用），流年/大运等事实由本地工具实时计算，模型只负责表达；每盘 5 次免费追问，断线重发走幂等回放不重复计次
 - **账号体系**：注册/登录，新用户 5 次免费 AI 解读；同一命盘二次查看走缓存，**永远不重复扣费**
-- **历史记录**：按账号隔离，访客排过的盘在注册后自动迁移到账号名下
+- **历史记录**：按账号隔离，访客排过的盘在注册后自动迁移到账号名下；删盘级联清空追问数据（隐私合规）
 - **成本可控**：单次解读 token 用量与成本可统计，缓存命中为 ¥0
 - **运营统计**：`/api/stats` 默认关闭，配置 `ADMIN_TOKEN` 后可查看账号、缓存、24h AI 成本与注册失败原因
 - **零依赖部署**：SQLite 单文件数据库，Docker Compose 一条命令上线
@@ -37,6 +38,8 @@
 │                 API 层（Flask + Gunicorn/gevent）     │
 │  /api/paipan     排盘（纯本地计算，不消耗配额）        │
 │  /api/interpret  AI 解读（SSE 流式，消耗配额）         │
+│  /api/chat       多轮追问（SSE 流式，LangGraph agent） │
+│  /api/chat/quota /api/chat/history   追问额度与会话   │
 │  /api/register   /api/login   /api/logout  账号体系   │
 │  /api/quota      /api/me     配额与会话查询           │
 │  /api/history    /api/history/<id>   历史记录         │
@@ -49,10 +52,11 @@
 │ · 公历→农历     │    │ · 账号/会话/配额（5次免费）      │
 │ · 四柱/十神     │    │ · AI 结果缓存（账号维度隔离）    │
 │ · 五行/神煞     │    │ · 历史记录与迁移                │
-│ · 大运/起运     │    │ ai_service.py                  │
-│ (sxtwl 天文历)  │    │ · DeepSeek 流式调用             │
-└────────────────┘    │ · Prompt 构建 / 成本核算        │
-                      └──────────┬─────────────────────┘
+│ · 大运/起运     │    │ · chat 追问额度/幂等/级联删除   │
+│ (sxtwl 天文历)  │    │ ai_service.py（报告链路）       │
+│                │    │ chat_tools.py / chat_graph.py   │
+│                │    │ · 追问 agent：4 只读工具+图编排  │
+└────────────────┘    └──────────┬─────────────────────┘
                                  │ HTTPS (stream=true)
                           ┌──────▼──────┐
                           │ DeepSeek API │
@@ -73,18 +77,20 @@
 | `ai_client.py` | 模型客户端层：DeepSeek/OpenAI 兼容请求、参数校验、流式解析和有限重试 |
 | `ai_validator.py` | 质量闸门：检查板块完整性、盘面证据、风险表达和输出长度 |
 | `ai_service.py` | AI 编排层：串联 context/prompt/client/validator，处理缓存、成本和 SSE 输出 |
+| `chat_tools.py` | 追问 agent 的工具层：流年/大运/古籍/临时排盘 4 个只读工具，姓名清洗防注入 |
+| `chat_graph.py` | 追问 agent 的图编排：LangGraph 状态图、checkpointer、SSE 事件解析 |
 | `tests/` `tools/` | 单元测试与 20 个固定命盘样本预检脚本 |
 | `Dockerfile` | 生产镜像（gunicorn + gevent，支持 SSE 长连接） |
 | `docker-compose.yml` | 一键部署 + 数据卷持久化 + 健康检查 |
 
-### 1.3 两条核心链路
+### 1.3 三条核心链路
 
 **排盘链路（免费、无 AI）**
 
 ```
 用户提交生辰 → 参数校验（含真实日期校验，如 2月30日拒绝）
 → bazi_engine.paipan() 本地确定性计算
-→ 结果落库（history 表）→ 返回 JSON
+→ 结果落库（history 表）→ 返回 JSON（含 history_id，供追问会话定位）
 ```
 
 **AI 解读链路（消耗配额、SSE 流式）**
@@ -97,6 +103,29 @@
       → 逐 chunk yield 给前端 → 完成后落缓存
       → 标记历史"已解读" → 扣配额（AI 失败则不扣）
 ```
+
+**chat 追问链路（每盘 5 次免费、SSE 流式、LangGraph agent）**
+
+```
+用户在结果页追问 → 校验登录态 + 命盘归属（hid 必须属于当前账号）
+→ 查幂等表（thread_id = 服务端拼接 账号:hid + 客户端 request_id）
+   ├─ 命中 → 免费回放已保存回复，不再扣次数
+   └─ 未命中 → 编译对话图 → 原子扣减追问额度（并发不可能双花）
+      → graph.stream(stream_mode="messages") 逐事件转发
+      → 模型按需调用只读工具（流年/大运/古籍/临时排盘）
+      → 完成后回复落幂等表；AI 异常退款
+```
+
+追问链路的几个关键设计：
+
+| 设计 | 目的 |
+|------|------|
+| 事实走工具，不走记忆 | 模型被禁止自行推算干支；query_liunian 等工具实时调本地引擎，杜绝历法幻觉 |
+| thread_id 服务端拼接 | 会话粒度 = 账号指纹:命盘id，客户端无法指定或窥探他人会话 |
+| request_id 幂等回放 | 断线重发同一 request_id 只回放已保存回复，不重复扣次数 |
+| 原子额度扣减 + 失败退款 | SQLite 单条 UPDATE 完成检查+扣减，多进程并发不双花；AI 异常自动退回 |
+| digest 存独立 state 字段 | 命盘摘要每回合前置进 system prompt，不进会话历史，永不重复、永不乱序 |
+| 删盘级联 | 删除历史记录时同步清空追问额度、对话记录与 checkpoint（生辰属敏感个人信息） |
 
 ### 1.4 设计原则：计算与生成分离
 
@@ -467,13 +496,18 @@ git log --oneline -5
 
 | 端点 | 方法 | 说明 | 消耗配额 |
 |------|------|------|----------|
-| `/api/paipan` | POST | 八字排盘（含日期合法性校验） | 否 |
+| `/api/paipan` | POST | 八字排盘（含日期合法性校验，返回 history_id） | 否 |
 | `/api/interpret` | POST | AI 流式解读（SSE，未登录 401） | 是（缓存/失败除外） |
+| `/api/chat` | POST | 多轮追问（SSE，request_id 幂等，未登录 401） | 追问额度（每盘 5 次） |
+| `/api/chat/quota` | GET | 查询某命盘剩余追问次数 | 否 |
+| `/api/chat/history` | GET | 从 checkpoint 恢复对话显示 | 否 |
 | `/api/register` `/api/login` `/api/logout` | POST | 账号体系 | 否 |
 | `/api/quota` `/api/me` | GET | 配额 / 会话查询 | 否 |
-| `/api/history` `/api/history/<id>` | GET/DELETE | 历史记录（账号隔离） | 否 |
+| `/api/history` `/api/history/<id>` | GET/DELETE | 历史记录（账号隔离；DELETE 级联清追问数据） | 否 |
 | `/health` | GET | 健康检查 | 否 |
 | `/api/stats` | GET | 管理统计（需 `ADMIN_TOKEN`） | 否 |
+
+chat SSE 事件格式：`{"type":"token","text":...}`（正文增量）、`{"type":"tool","name":...}`（工具调用提示）、`{"type":"done","quota_left":N,"cached":bool}`、`{"type":"error","message":...}`（额度已退回）。
 
 ## 技术栈
 
@@ -483,8 +517,16 @@ git log --oneline -5
 | 后端 | Flask 3 + Gunicorn(gevent) | gevent 协程支撑 SSE 长连接 |
 | 排盘 | sxtwl（寿星天文历） | 节气级精确，业界排盘软件同源历法 |
 | AI | DeepSeek V4 Flash Chat Completions | 中文长文本输出、SSE流式体验和成本控制更适合Demo验证 |
+| 追问 Agent | LangGraph + SqliteSaver | 工具调用编排、多轮 checkpoint 持久化，gevent 下单线程 greenlet 天然串行 |
 | 数据 | SQLite | 单文件零运维，Demo 场景最优解 |
 | 部署 | Docker Compose | 一条命令，健康检查自愈 |
+
+## 已知边界
+
+- **追问断流重发**：断线时模型已生成部分文本会被保存，重发同一 request_id 走回放不重复计次；但若断流时一个字未生成（已退款），重发会在对话历史上出现一次重复的用户消息，模型仍会正常作答（P1 接受，checkpoint 回滚留待后续优化）。
+- **无 API key 环境**：`DEEPSEEK_API_KEY` 缺失时追问与对话历史恢复均返回 503（报告解读同样不可用），排盘不受影响。
+- **chat 用量日志**：追问链路暂未记录 token 明细（`usage_logs` 记 0），成本核算以报告链路为准。
+- **同盘并发追问**：同一命盘的两个并发请求可能产生 checkpoint 状态竞争，单人单盘场景概率极低，P1 不做锁。
 
 ## 后续路线
 
@@ -495,6 +537,7 @@ git log --oneline -5
 | 评测样本扩容 | 从 20 个固定样本扩展到 50-100 个典型命盘，比较 Prompt 版本效果 | 避免靠主观感觉调 Prompt，让 AI 质量可回归 |
 | 报告长图/分享页 | 生成隐私脱敏的报告长图或只读分享链接 | 提高传播感，也能作为作品集展示素材 |
 | 知识库升级 | 继续扩充可追溯命理知识片段，评测稳定后再考虑轻量 RAG | 提升专业感，同时控制古籍引用幻觉 |
+| 追问链路增强 | checkpoint 回滚修复断流重发边界；token 用量入账；追问转付费额度 | 追问链路从 P1 走向可运营 |
 | 域名与 HTTPS | 正式对外试用时绑定域名、启用证书，并收紧 CORS 白名单 | 提升信任、安全和访问专业度 |
 
 ## License

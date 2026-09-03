@@ -49,6 +49,7 @@ except ImportError:
 import db
 import ai_service
 from bazi_engine import paipan
+from chat_personas import DEFAULT_PERSONA_ID, PERSONAS, PERSONA_LIST, get_persona
 
 
 def _csv_env(name):
@@ -322,14 +323,17 @@ def api_paipan():
         # 保存到历史记录
         fingerprint = get_fingerprint(request)
         name = data.get('name', '')
-        db.save_history(
+        hid = db.save_history(
             fingerprint, name, data['gender'],
             result['solar_date'],
             json.dumps(result, ensure_ascii=False),
             has_ai=False
         )
 
-        return jsonify(result)
+        # history_id 供前端建立 chat 追问会话（排盘数据 schema 不变）
+        payload = dict(result)
+        payload['history_id'] = hid
+        return jsonify(payload)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -668,10 +672,354 @@ def api_history_detail(hid):
 
 @app.route('/api/history/<int:hid>', methods=['DELETE'])
 def api_history_delete(hid):
-    """删除某条历史"""
+    """删除某条历史。
+
+    级联清理 chat 追问数据（隐私合规，agent-plan §5 P0）：
+    命盘已删而追问额度/对话记录/checkpoint 残留 = 生辰敏感信息泄露。
+    """
     fingerprint = get_fingerprint(request)
     db.delete_history(hid, fingerprint)
-    return jsonify({'ok': True})
+    chat_removed = db.delete_chat_cascade(fingerprint, hid)
+    # checkpoint 线程清理由 chat_graph 负责（惰性 import：
+    # langgraph 未安装时 DB 侧级联已执行，不因组件缺失而删盘失败）
+    try:
+        import chat_graph
+        chat_graph.delete_chat_thread(db.build_chat_thread_id(fingerprint, hid))
+    except ImportError:
+        pass
+    return jsonify({'ok': True, 'chat_removed': chat_removed})
+
+
+# ==================== chat 追问链路（agent-plan v4.1 §4） ====================
+
+CHAT_MAX_INPUT_CHARS = int(os.environ.get('CHAT_MAX_INPUT_CHARS', '500'))
+CHAT_REQUEST_ID_MAX_LEN = 64
+CHAT_PERSONA_ID_MAX_LEN = 32  # persona 白名单键长度上限（防御超长垃圾输入）
+
+
+def _chat_auth():
+    """chat 链路必须登录：配额按账号+命盘计，匿名指纹可换设备刷额度。
+
+    返回 (fingerprint, auth_token)；未登录返回 (None, None)。
+    """
+    auth_token = get_auth_token(request)
+    if not auth_token:
+        return None, None
+    fingerprint = db.get_account_fingerprint(auth_token)
+    if not fingerprint:
+        return None, None
+    return fingerprint, auth_token
+
+
+def _split_reply_text(text, chunk_limit=24):
+    """幂等回放时把整段回复切成小段，模拟打字机节奏（与 /api/interpret 缓存回放一致）。"""
+    chunks = []
+    current = ''
+    for char in text:
+        current += char
+        if char in '。！？\n' or len(current) >= chunk_limit:
+            chunks.append(current)
+            current = ''
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
+    """对已解读命盘的多轮追问（SSE 流式）。
+
+    请求体：{"hid": <int>, "message": <str>, "request_id": <str>, "persona": <str 可选>}
+    request_id 由客户端生成（如 crypto.randomUUID），断线重发同一 id 走幂等回放。
+    persona 不传或空串回落缺省道长（清虚，旧客户端零改动）；白名单外一律 400
+    （用户文本进 system prompt 是注入面，人格入口只有注册表，persona-plan §9）。
+
+    时序（顺序是契约的一部分，agent-plan §4.7；persona 校验位次 persona-plan §5.2）：
+    1. 登录校验 → 401
+    2. 参数校验 → 400（persona 不在白名单同此）
+    3. 命盘归属校验 → 404（thread_id 服务端拼接，客户端不可指定）
+    4. 幂等回放：该 request_id 已答过 → 免费回放，不再扣额度
+    5. 编译对话图（persona 注入模型档与风格档）→ 配置缺失 503
+    6. 原子扣减该道长价格的香火 → 余额不足 403（带明细）
+    7. 流式生成；异常退款；成功落幂等表（含 price/persona）
+    """
+    fingerprint, _ = _chat_auth()
+    if not fingerprint:
+        return jsonify({'error': '请先登录', 'need_login': True}), 401
+
+    body = request.get_json(silent=True) or {}
+    hid = body.get('hid')
+    message = str(body.get('message', '') or '').strip()
+    request_id = str(body.get('request_id', '') or '').strip()
+    raw_persona = body.get('persona', '')
+
+    if not isinstance(hid, int) or isinstance(hid, bool) or hid <= 0:
+        return jsonify({'error': '参数不完整', 'message': '缺少有效的命盘编号 hid'}), 400
+    if not message:
+        return jsonify({'error': '参数不完整', 'message': '追问内容不能为空'}), 400
+    if len(message) > CHAT_MAX_INPUT_CHARS:
+        return jsonify({
+            'error': '输入过长',
+            'message': f'追问请控制在{CHAT_MAX_INPUT_CHARS}字以内',
+        }), 400
+    if not request_id or len(request_id) > CHAT_REQUEST_ID_MAX_LEN:
+        return jsonify({
+            'error': '参数不完整',
+            'message': '缺少 request_id（客户端生成，用于断线重试的幂等保护）',
+        }), 400
+    if not isinstance(raw_persona, str) or len(raw_persona) > CHAT_PERSONA_ID_MAX_LEN:
+        return jsonify({'error': '参数不完整', 'message': 'persona 参数格式不正确'}), 400
+    # 空串/缺省回落缺省道长；非空必须命中注册表白名单（大小写敏感，不静默纠偏）
+    persona = get_persona(raw_persona.strip())
+    if persona is None:
+        return jsonify({
+            'error': '参数不完整',
+            'message': f'观中没有这位道长：{raw_persona.strip()}',
+        }), 400
+
+    detail = db.get_history_detail(hid, fingerprint)
+    if not detail:
+        return jsonify({'error': '记录不存在', 'message': '命盘不存在或不属于当前账号'}), 404
+
+    thread_id = db.build_chat_thread_id(fingerprint, hid)
+    name = detail.get('name', '')
+
+    # --- 幂等回放：同 (thread, request_id) 已答过只回放，绝不改写历史回复 ---
+    cached = db.get_chat_reply(thread_id, request_id)
+    if cached:
+        db.log_usage(fingerprint, '/api/chat', True, 0, 0)
+
+        def replay_stream():
+            for chunk_text in _split_reply_text(cached['reply_text']):
+                yield chat_graph_dump_sse({'type': 'token', 'text': chunk_text})
+            # 回放带当时的 price 与 persona（persona-plan §5.3）：
+            # 回放的是当时那位道长的回复，账目字段如实还原
+            yield chat_graph_dump_sse({
+                'type': 'done',
+                'quota_left': cached['quota_left'],
+                'price': cached['price'],
+                'persona': cached['persona'],
+                'request_id': request_id,
+                'cached': True,
+            })
+
+        return Response(
+            replay_stream(),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+                'X-Quota-Left': str(cached['quota_left']),
+                'X-Cache-Hit': 'true',
+            },
+        )
+
+    # --- 编译对话图（惰性 import：langgraph 缺失只影响 chat 链路） ---
+    try:
+        import chat_graph
+    except ImportError:
+        return jsonify({'error': '服务暂不可用', 'message': '对话组件未安装'}), 503
+
+    try:
+        paipan_data = json.loads(detail['paipan_json'])
+        # persona 注入：风格档（system prompt）与模型档（采样参数/模型名）一起换
+        graph = chat_graph.build_chat_graph(
+            paipan_data, name=name, persona_id=persona.persona_id
+        )
+    except chat_graph.ChatConfigError:
+        return jsonify({'error': '服务暂不可用', 'message': 'AI 服务未配置，请稍后再试'}), 503
+
+    # --- 原子扣减香火（gate 语义；并发不可能双花，见 db.consume_chat_quota） ---
+    # 扣减价 = 该道长注册表定价；不传 persona 的旧客户端按缺省道长 2 炷计价，
+    # 用户可见行为与旧"每盘 5 次追问"等价（10 炷 ÷ 2，persona-plan §3）。
+    ok, used = db.consume_chat_quota(hid, fingerprint, persona.price_incense)
+    quota_left = max(0, db.CHAT_FREE_INCENSE - used)
+    if not ok:
+        # 403 带明细（persona-plan §5.2）：用户失败得明白——差几炷、该道长几炷
+        return jsonify({
+            'error': '香火不足',
+            'message': (
+                f'请教{persona.title}需 {persona.price_incense} 炷香，'
+                f'当前余额 {quota_left} 炷'
+            ),
+            'quota_left': quota_left,
+            'persona_price': persona.price_incense,
+        }), 403
+
+    # --- 流式生成 ---
+    def generate():
+        reply_text = ''
+        try:
+            stream = graph.stream(
+                {
+                    # dict 形式的 human 消息：add_messages 自动转换，
+                    # 避免 app.py 顶层依赖 langchain
+                    'messages': [{'role': 'user', 'content': message}],
+                    'chat_quota_left': quota_left,
+                },
+                config=chat_graph.chat_invoke_config(thread_id),
+                stream_mode='messages',
+            )
+            for event in stream:
+                payload = chat_graph.parse_stream_event(event)
+                if payload:
+                    yield chat_graph_dump_sse(payload)
+                    if payload.get('type') == 'token':
+                        reply_text += payload.get('text', '')
+
+            # 正常完成：落幂等表，此后同 request_id 重发只回放
+            db.save_chat_reply(
+                thread_id, request_id, reply_text, quota_left,
+                persona.price_incense, persona.persona_id,
+            )
+            db.log_usage(fingerprint, '/api/chat', False, 0, 0)
+            yield chat_graph_dump_sse({
+                'type': 'done',
+                'quota_left': quota_left,
+                'price': persona.price_incense,
+                'persona': persona.persona_id,
+                'request_id': request_id,
+                'cached': False,
+            })
+        except GeneratorExit:
+            # 客户端断开：模型调用已实际消耗。已吐出部分文本则落库
+            # （重发同 request_id 回放）；一个字没吐才退款。
+            # 已知边界：断流重发会在 checkpoint 里重复一条 human 消息
+            # （P1 接受，README 记录；checkpoint 回滚留待 P2）。
+            if reply_text:
+                db.save_chat_reply(
+                    thread_id, request_id, reply_text, quota_left,
+                    persona.price_incense, persona.persona_id,
+                )
+            else:
+                db.refund_chat_quota(hid, fingerprint, persona.price_incense)
+            raise
+        except Exception:
+            logger.exception('chat stream failed: thread=%s request=%s', thread_id, request_id)
+            db.refund_chat_quota(hid, fingerprint, persona.price_incense)
+            yield chat_graph_dump_sse({
+                'type': 'error',
+                'message': 'AI 服务暂时不可用，香火已退回，请稍后重试',
+            })
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'X-Quota-Left': str(quota_left),
+        },
+    )
+
+
+@app.route('/api/chat/personas', methods=['GET'])
+def api_chat_personas():
+    """道长花名册（persona-plan §5.1，前端选择条的数据源）。
+
+    返回有序数组：[{persona_id, title, tagline, price, affordable, current}]
+    - ?hid=N：按当前余额逐位标注 affordable（前端置灰余额不足的道长），
+      current = 该盘最近一次真实请教的道长（无记录回落缺省）。
+    - 不带 hid：纯花名册，affordable 全 true（未查余额），current = 缺省。
+    顺序 = 注册表注册顺序 = 前端卡片展示顺序（PERSONA_LIST 是产品契约）。
+    """
+    fingerprint, _ = _chat_auth()
+    if not fingerprint:
+        return jsonify({'error': '请先登录', 'need_login': True}), 401
+
+    hid = request.args.get('hid', type=int)
+    quota_left = None
+    current_id = DEFAULT_PERSONA_ID
+    if hid is not None:
+        if not hid or hid <= 0:
+            return jsonify({'error': '参数不完整', 'message': '缺少有效的命盘编号 hid'}), 400
+        if not db.get_history_detail(hid, fingerprint):
+            return jsonify({'error': '记录不存在', 'message': '命盘不存在或不属于当前账号'}), 404
+        quota_left = db.get_chat_quota_left(hid, fingerprint)
+        last = db.get_last_chat_persona(db.build_chat_thread_id(fingerprint, hid))
+        # 白名单兜底：历史 persona 若已下架，回落缺省而非卡死花名册
+        if last in PERSONAS:
+            current_id = last
+
+    return jsonify([
+        {
+            'persona_id': p.persona_id,
+            'title': p.title,
+            'tagline': p.tagline,
+            'price': p.price_incense,
+            'affordable': True if quota_left is None else p.price_incense <= quota_left,
+            'current': p.persona_id == current_id,
+        }
+        for p in PERSONA_LIST
+    ])
+
+
+@app.route('/api/chat/quota', methods=['GET'])
+def api_chat_quota():
+    """查询某命盘的剩余追问次数。"""
+    fingerprint, _ = _chat_auth()
+    if not fingerprint:
+        return jsonify({'error': '请先登录', 'need_login': True}), 401
+    hid = request.args.get('hid', type=int)
+    if not hid or hid <= 0:
+        return jsonify({'error': '参数不完整', 'message': '缺少有效的命盘编号 hid'}), 400
+    if not db.get_history_detail(hid, fingerprint):
+        return jsonify({'error': '记录不存在'}), 404
+    return jsonify({
+        'hid': hid,
+        'quota_left': db.get_chat_quota_left(hid, fingerprint),
+        'limit': db.CHAT_FREE_INCENSE,
+    })
+
+
+@app.route('/api/chat/history', methods=['GET'])
+def api_chat_history():
+    """从 checkpoint 恢复对话显示（刷新页面后重建聊天记录）。
+
+    只回放 human 与 AI 终稿消息；工具调用与工具结果不外发。
+    """
+    fingerprint, _ = _chat_auth()
+    if not fingerprint:
+        return jsonify({'error': '请先登录', 'need_login': True}), 401
+    hid = request.args.get('hid', type=int)
+    if not hid or hid <= 0:
+        return jsonify({'error': '参数不完整', 'message': '缺少有效的命盘编号 hid'}), 400
+    detail = db.get_history_detail(hid, fingerprint)
+    if not detail:
+        return jsonify({'error': '记录不存在'}), 404
+
+    try:
+        import chat_graph
+    except ImportError:
+        return jsonify({'error': '服务暂不可用', 'message': '对话组件未安装'}), 503
+    try:
+        paipan_data = json.loads(detail['paipan_json'])
+        graph = chat_graph.build_chat_graph(paipan_data, name=detail.get('name', ''))
+    except chat_graph.ChatConfigError:
+        return jsonify({'error': '服务暂不可用', 'message': 'AI 服务未配置'}), 503
+
+    thread_id = db.build_chat_thread_id(fingerprint, hid)
+    snap = graph.get_state(config=chat_graph.chat_invoke_config(thread_id))
+    values = (snap.values or {}) if (snap and snap.values) else {}
+    messages = []
+    for msg in values.get('messages', []):
+        mtype = getattr(msg, 'type', '')
+        content = str(getattr(msg, 'content', '') or '')
+        if mtype == 'human' and content:
+            messages.append({'role': 'user', 'content': content})
+        elif mtype == 'ai' and content and not getattr(msg, 'tool_calls', None):
+            messages.append({'role': 'assistant', 'content': content})
+
+    return jsonify({
+        'hid': hid,
+        'messages': messages,
+        'quota_left': db.get_chat_quota_left(hid, fingerprint),
+    })
+
+
+def chat_graph_dump_sse(payload):
+    """chat SSE data 行（路由层使用的唯一 SSE 编码入口，便于统一测试）。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 # ==================== 前端HTML ====================
@@ -1191,6 +1539,71 @@ INDEX_HTML = r'''
         @keyframes ai-pulse { 0%, 100% { box-shadow: 0 0 0 0 var(--gold-shadow); } 50% { box-shadow: 0 0 0 5px transparent; } }
         @keyframes ai-shimmer { to { transform: translateX(100%); } }
 
+        /* chat 追问区 */
+        .chat-section {
+            display: none; margin-top: 1.5rem; padding: clamp(1rem, 3vw, 1.6rem);
+            border: 1px solid var(--border); border-radius: 14px; background: var(--bg-card);
+            animation: ai-rise 0.3s cubic-bezier(.2,.85,.25,1) both;
+        }
+        .chat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; margin-bottom: 0.9rem; }
+        .chat-title { color: var(--gold-bright); font-size: 1.05rem; }
+        .chat-quota { color: var(--text-dim); font-size: 0.78rem; white-space: nowrap; }
+        .chat-messages {
+            display: flex; flex-direction: column; gap: 0.7rem; max-height: 46vh; overflow-y: auto;
+            padding: 0.2rem; margin-bottom: 0.9rem; scrollbar-width: thin;
+        }
+        .chat-bubble {
+            max-width: 86%; padding: 0.55rem 0.8rem; border-radius: 12px;
+            font-size: 0.9rem; line-height: 1.8; word-break: break-word; white-space: pre-wrap;
+            animation: ai-rise 0.25s ease both;
+        }
+        .chat-bubble.user {
+            align-self: flex-end; background: var(--gold-tint); color: var(--text);
+            border: 1px solid var(--gold-border); border-bottom-right-radius: 4px;
+        }
+        .chat-bubble.assistant {
+            align-self: flex-start; background: var(--bg-card-hover); color: var(--text);
+            border: 1px solid var(--border); border-bottom-left-radius: 4px;
+        }
+        .chat-bubble.replay-note { align-self: center; background: transparent; color: var(--text-dim); font-size: 0.72rem; border: 0; padding: 0.1rem; }
+        .chat-status { display: none; color: var(--gold); font-size: 0.78rem; margin-bottom: 0.6rem; }
+        .chat-status.busy { display: block; animation: ai-pulse 1.6s ease-in-out infinite; }
+        .chat-input-row { display: flex; gap: 0.6rem; align-items: flex-end; }
+        .chat-input {
+            flex: 1; min-height: 44px; max-height: 120px; resize: vertical;
+            padding: 0.6rem 0.75rem; border: 1px solid var(--border); border-radius: 10px;
+            background: var(--bg-dark); color: var(--text); font-family: inherit; font-size: 0.9rem;
+            line-height: 1.6;
+        }
+        .chat-input:focus { outline: none; border-color: var(--gold-border); }
+        .chat-send-btn {
+            min-height: 44px; padding: 0 1.05rem; font-size: 0.9rem; flex-shrink: 0;
+        }
+        .chat-send-btn:disabled { opacity: 0.6; cursor: default; transform: none; }
+        .chat-note { margin-top: 0.7rem; color: var(--text-dim); font-size: 0.74rem; line-height: 1.6; }
+        .chat-error { color: var(--red-bright); font-size: 0.8rem; margin-bottom: 0.6rem; display: none; }
+
+        /* 道长选择条（persona-plan §6）：五张卡片横向排布，选中高亮、余额不足置灰 */
+        .persona-bar {
+            display: flex; gap: 0.45rem; overflow-x: auto; margin-bottom: 0.9rem;
+            padding-bottom: 0.1rem; scrollbar-width: thin;
+        }
+        .persona-card {
+            flex: 1 1 0; min-width: 104px; text-align: left; cursor: pointer;
+            padding: 0.5rem 0.6rem 0.45rem; border: 1px solid var(--border);
+            border-radius: 10px; background: var(--bg-dark); font-family: inherit;
+            transition: border-color 0.2s, background 0.2s, opacity 0.2s;
+        }
+        .persona-card:hover { border-color: var(--gold-dim); }
+        .persona-card.current { border-color: var(--gold); background: var(--gold-tint); }
+        .persona-card:focus-visible { outline: 2px solid var(--gold-bright); outline-offset: -2px; }
+        .persona-title { color: var(--text); font-size: 0.86rem; margin-bottom: 0.1rem; }
+        .persona-card.current .persona-title { color: var(--gold-bright); }
+        .persona-tagline { color: var(--text-dim); font-size: 0.66rem; line-height: 1.45; }
+        .persona-price { color: var(--gold); font-size: 0.68rem; margin-top: 0.28rem; }
+        .persona-card.unaffordable { opacity: 0.45; cursor: default; }
+        .persona-card.unaffordable:hover { border-color: var(--border); }
+
         /* Tab切换 */
         .ai-tabs {
             display: flex; gap: 0; margin-bottom: 1rem;
@@ -1654,6 +2067,26 @@ INDEX_HTML = r'''
                 <div class="ai-meta" id="r_ai_meta" style="display:none;">
                     <div class="ai-meta-item" id="r_source_tag" style="display:none;">引据典籍: <span></span></div>
                 </div>
+            </div>
+
+            <!-- chat 追问区：看盘追问，多轮上下文在服务端 -->
+            <div class="chat-section" id="chatSection">
+                <div class="chat-head">
+                    <div class="chat-title">继续追问道长</div>
+                    <div class="chat-quota" id="chatQuota"></div>
+                </div>
+                <!-- 道长选择条：卡片数据来自 /api/chat/personas?hid=，选中即改后续 persona -->
+                <div class="persona-bar" id="personaBar" role="group" aria-label="选择请教的道长"></div>
+                <div class="chat-messages" id="chatMessages" aria-live="polite"></div>
+                <div class="chat-status" id="chatStatus" role="status"></div>
+                <div class="chat-error" id="chatError" role="alert"></div>
+                <div class="chat-input-row">
+                    <textarea class="chat-input" id="chatInput" rows="1" maxlength="500"
+                              placeholder="针对此盘追问，如：2027年流年如何？"></textarea>
+                    <button class="btn-divine chat-send-btn" id="chatSendBtn" type="button"
+                            onclick="sendChat()">追问</button>
+                </div>
+                <div class="chat-note">每个命盘赠 10 炷香火，各道长每问耗香不同（见卡片标价）；追问按多轮上下文连续回答，回复仅作传统文化参考。</div>
             </div>
         </div>
     </div>
@@ -2306,6 +2739,7 @@ INDEX_HTML = r'''
             }
             localStorage.removeItem('xjg_auth_token');
             localStorage.removeItem('xjg_username');
+            resetChat();  // chat 会话按账号隔离，登出即收起
             updateQuota();
             loadHistory();  // 退出后回到匿名身份的历史记录
         }
@@ -2335,6 +2769,18 @@ INDEX_HTML = r'''
         }
         loadAuthConfig();
         updateQuota();
+
+        // chat 输入框：Enter 发送（Shift+Enter 换行；输入法组合期间不触发）
+        (function() {
+            const input = document.getElementById('chatInput');
+            if (!input) return;
+            input.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+                    e.preventDefault();
+                    sendChat();
+                }
+            });
+        })();
 
         // === 历史记录 ===
         async function loadHistory() {
@@ -2394,6 +2840,9 @@ INDEX_HTML = r'''
                 currentResultData = detail.paipan;
                 updateAIGetBtn();
                 document.getElementById('aiGetBtn').style.display = 'block';
+
+                // chat 追问区随命盘切换（hid 即历史记录 id）
+                openChat(detail.id);
 
                 // 滚动到结果区
                 document.getElementById('resultSection').scrollIntoView({behavior:'smooth'});
@@ -2549,6 +2998,359 @@ INDEX_HTML = r'''
                 setAIReportActionsVisible(false);
                 setAIQualityNote('请求失败: ' + e.message + '。请稍后重试。', 'error');
                 if (btn) { btn.style.display = 'block'; }
+            }
+        }
+
+        // ==================== chat 追问链路 ====================
+        let chatHid = null;
+        let chatStreaming = false;
+        let chatRetryPayload = null;   // {message, request_id}：断线后重发同一 id 走幂等
+        const CHAT_TOOL_HINTS = {
+            query_liunian: '正在查阅流年干支...',
+            query_dayun: '正在核对大运...',
+            lookup_classics: '正在翻检典籍...',
+            query_paipan: '正在另起一盘参看...',
+        };
+
+        function chatEl(id) { return document.getElementById(id); }
+
+        // 道长选择条状态（persona-plan §6）：花名册缓存 + 当前选中 + 本地余额
+        let chatPersonas = [];      // /api/chat/personas 返回（有序）
+        let chatPersonaId = null;   // 当前选中；null = 尚未加载（发请求时不带 persona，服务端回落缺省）
+        let chatQuotaLeft = null;   // 本地缓存的香火余额（null = 未知，置灰逻辑跳过）
+
+        function personaTitle(personaId) {
+            const p = chatPersonas.find(x => x.persona_id === personaId);
+            return p ? p.title : '';
+        }
+
+        function renderPersonaBar(quotaLeft) {
+            const bar = chatEl('personaBar');
+            if (!chatPersonas.length) { bar.style.display = 'none'; return; }
+            bar.style.display = 'flex';
+            bar.innerHTML = '';
+            for (const p of chatPersonas) {
+                // 余额未知（null）时不置灰；已知则按各道长定价逐位标注
+                const unaffordable = (typeof quotaLeft === 'number') && p.price > quotaLeft;
+                const card = document.createElement('button');
+                card.type = 'button';
+                card.className = 'persona-card'
+                    + (p.persona_id === chatPersonaId ? ' current' : '')
+                    + (unaffordable ? ' unaffordable' : '');
+                card.setAttribute('aria-pressed', p.persona_id === chatPersonaId ? 'true' : 'false');
+                const title = document.createElement('div');
+                title.className = 'persona-title';
+                title.textContent = p.title;
+                const tagline = document.createElement('div');
+                tagline.className = 'persona-tagline';
+                tagline.textContent = p.tagline;
+                const price = document.createElement('div');
+                price.className = 'persona-price';
+                price.textContent = '每问 ' + p.price + ' 炷香';
+                card.appendChild(title);
+                card.appendChild(tagline);
+                card.appendChild(price);
+                card.onclick = function() { selectPersona(p.persona_id); };
+                bar.appendChild(card);
+            }
+        }
+
+        function selectPersona(personaId) {
+            if (personaId === chatPersonaId) return;
+            const p = chatPersonas.find(x => x.persona_id === personaId);
+            if (!p) return;
+            const switching = chatPersonaId !== null
+                && chatEl('chatMessages').children.length > 0;
+            chatPersonaId = personaId;
+            renderPersonaBar(chatQuotaLeft);
+            // 换人轻提示（persona-plan §4.2）：不弹窗不打断，一行小字
+            if (switching) {
+                appendChatBubble('replay-note', '已改请教' + p.title + '，前情他已看过。');
+            }
+        }
+
+        async function loadChatPersonas() {
+            const hid = chatHid;
+            if (!hid) return;
+            try {
+                const res = await apiFetch('/api/chat/personas?hid=' + hid);
+                if (chatHid !== hid) return;  // 期间已切盘，丢弃过期响应
+                if (res.status === 401) {
+                    // 未登录：藏起选择条，登录后随 openChat 重新拉取
+                    chatPersonas = [];
+                    chatPersonaId = null;
+                    renderPersonaBar(null);
+                    return;
+                }
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!Array.isArray(data) || !data.length) return;
+                chatPersonas = data;
+                // 服务端 current = 该盘最近一次请教的道长（无记录回落缺省清虚）
+                // 手工选中只在本次页面会话内生效，刷新后仍以服务端记录恢复
+                const current = data.find(x => x.current);
+                chatPersonaId = current ? current.persona_id : 'qingxu';
+                renderPersonaBar(chatQuotaLeft);
+            } catch (e) {}
+        }
+
+        function appendChatBubble(role, text) {
+            const wrap = chatEl('chatMessages');
+            const el = document.createElement('div');
+            el.className = 'chat-bubble ' + role;
+            el.textContent = text || '';
+            wrap.appendChild(el);
+            wrap.scrollTop = wrap.scrollHeight;
+            return el;
+        }
+
+        function setChatStatus(text) {
+            const el = chatEl('chatStatus');
+            if (text) {
+                el.textContent = text;
+                el.classList.add('busy');
+            } else {
+                el.classList.remove('busy');
+                el.textContent = '';
+            }
+        }
+
+        function showChatError(text) {
+            const el = chatEl('chatError');
+            el.textContent = text;
+            el.style.display = 'block';
+        }
+
+        function clearChatError() {
+            const el = chatEl('chatError');
+            el.textContent = '';
+            el.style.display = 'none';
+        }
+
+        function showChatRetryError() {
+            const el = chatEl('chatError');
+            el.textContent = '';
+            el.style.display = 'block';
+            el.appendChild(document.createTextNode('连接中断，回复可能不完整。'));
+            const btn = document.createElement('button');
+            btn.className = 'ai-share-btn';
+            btn.style.marginLeft = '0.5rem';
+            btn.textContent = '重发恢复';
+            // 同 request_id 重发：服务端已答过的部分直接回放，不重复扣次数
+            btn.onclick = function() { clearChatError(); sendChat(true); };
+            el.appendChild(btn);
+        }
+
+        function updateChatQuota(left) {
+            const el = chatEl('chatQuota');
+            const btn = chatEl('chatSendBtn');
+            if (typeof left !== 'number') return;
+            chatQuotaLeft = left;
+            // 香火制文案（persona-plan §6）：函数名保留，单位换炷
+            el.textContent = left > 0 ? ('香火 ' + left + ' 炷') : '香火已尽';
+            btn.disabled = left <= 0 || chatStreaming;
+            btn.textContent = left <= 0 ? '香火已尽' : '追问';
+            // 余额变化同步选择条置灰（本地判断，省一次花名册请求）
+            renderPersonaBar(left);
+        }
+
+        function setChatStreaming(streaming) {
+            chatStreaming = streaming;
+            const btn = chatEl('chatSendBtn');
+            btn.disabled = streaming || (chatHid === null);
+            btn.textContent = streaming ? '推演中...' : btn.textContent.replace('推演中...', '追问');
+            if (!streaming && chatHid !== null) loadChatQuota();
+        }
+
+        function resetChat() {
+            chatHid = null;
+            chatRetryPayload = null;
+            chatPersonas = [];
+            chatPersonaId = null;
+            chatQuotaLeft = null;
+            chatEl('chatMessages').innerHTML = '';
+            chatEl('personaBar').innerHTML = '';
+            chatEl('chatSection').style.display = 'none';
+            setChatStatus('');
+            clearChatError();
+        }
+
+        function openChat(hid) {
+            if (!hid) { resetChat(); return; }
+            if (chatHid === hid && chatEl('chatSection').style.display === 'block') return;
+            chatHid = hid;
+            chatRetryPayload = null;
+            chatPersonaId = null;   // 切盘后由花名册 current 重新定选中
+            chatQuotaLeft = null;
+            chatEl('chatMessages').innerHTML = '';
+            chatEl('chatSection').style.display = 'block';
+            loadChatHistory();
+            loadChatQuota();
+            loadChatPersonas();
+        }
+
+        async function loadChatQuota() {
+            const hid = chatHid;
+            try {
+                const res = await apiFetch('/api/chat/quota?hid=' + hid);
+                if (chatHid !== hid) return;  // 期间已切盘，丢弃过期响应
+                if (res.status === 401) {
+                    chatEl('chatQuota').textContent = '登录后可追问';
+                    return;
+                }
+                const data = await res.json();
+                updateChatQuota(data.quota_left);
+            } catch (e) {}
+        }
+
+        async function loadChatHistory() {
+            const hid = chatHid;
+            try {
+                const res = await apiFetch('/api/chat/history?hid=' + hid);
+                if (chatHid !== hid) return;  // 期间已切盘，丢弃过期响应
+                if (res.status === 401) {
+                    appendChatBubble('replay-note', '登录后可与道长继续对话，追问记录会保留。');
+                    return;
+                }
+                const data = await res.json();
+                if (data.messages && data.messages.length) {
+                    data.messages.forEach(m => appendChatBubble(
+                        m.role === 'user' ? 'user' : 'assistant', m.content
+                    ));
+                }
+                updateChatQuota(data.quota_left);
+            } catch (e) {}
+        }
+
+        function makeChatRequestId() {
+            if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+            return 'req-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+        }
+
+        async function sendChat(isRetry) {
+            if (chatStreaming || chatHid === null) return;
+            const input = chatEl('chatInput');
+            const text = isRetry && chatRetryPayload ? chatRetryPayload.message : input.value.trim();
+            if (!text) return;
+            const requestId = isRetry && chatRetryPayload
+                ? chatRetryPayload.request_id
+                : makeChatRequestId();
+
+            if (!isRetry) {
+                appendChatBubble('user', text);
+                input.value = '';
+                chatRetryPayload = {message: text, request_id: requestId};
+            }
+            const assistantEl = appendChatBubble('assistant', '');
+            clearChatError();
+            setChatStreaming(true);
+
+            const removeBubble = function(el) { if (el && el.parentNode) el.parentNode.removeChild(el); };
+
+            try {
+                const res = await apiFetch('/api/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    // persona 为空串时服务端回落缺省道长（未加载完花名册的兜底）
+                    body: JSON.stringify({
+                        hid: chatHid, message: text, request_id: requestId,
+                        persona: chatPersonaId || ''
+                    })
+                });
+
+                if (res.status === 401) {
+                    removeBubble(assistantEl);
+                    input.value = text;
+                    chatRetryPayload = null;
+                    setChatStreaming(false);
+                    showChatError('追问需要登录，新注册用户即可使用。');
+                    showAuthModal('login');
+                    return;
+                }
+                if (res.status === 403) {
+                    removeBubble(assistantEl);
+                    setChatStreaming(false);
+                    // 服务端明细（persona-plan §5.2）："请教掌门真人需 5 炷香，当前余额 3 炷"
+                    let msg = '香火已尽，可回看已生成的报告。';
+                    try {
+                        const data = await res.json();
+                        if (data && data.message) msg = data.message;
+                    } catch (e) {}
+                    showChatError(msg);
+                    loadChatQuota();
+                    return;
+                }
+                if (!res.ok || !res.body) {
+                    let msg = '服务暂时不可用，请稍后重试。';
+                    try {
+                        const data = await res.json();
+                        if (data && data.message) msg = data.message;
+                    } catch (e) {}
+                    removeBubble(assistantEl);
+                    setChatStreaming(false);
+                    showChatError(msg);
+                    return;
+                }
+
+                // SSE 流式读取（与 AI 解读相同的解析协议）
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let gotDone = false;
+                let gotError = false;
+
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, {stream: true});
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        let chunk;
+                        try { chunk = JSON.parse(line.slice(6)); } catch (e) { continue; }
+                        if (chunk.type === 'token' && chunk.text) {
+                            assistantEl.textContent += chunk.text;
+                            chatEl('chatMessages').scrollTop = chatEl('chatMessages').scrollHeight;
+                        } else if (chunk.type === 'tool') {
+                            setChatStatus(CHAT_TOOL_HINTS[chunk.name] || '正在查阅资料...');
+                        } else if (chunk.type === 'done') {
+                            gotDone = true;
+                            setChatStatus('');
+                            if (chunk.quota_left !== undefined) updateChatQuota(chunk.quota_left);
+                            if (chunk.cached) {
+                                appendChatBubble('replay-note', '已展开此前未收完的回复，不重复计香。');
+                            } else if (chunk.persona && chunk.price) {
+                                // 计香行（persona-plan §6）：谁答的、上了几炷香
+                                const t = personaTitle(chunk.persona);
+                                appendChatBubble('replay-note', t
+                                    ? ('请教' + t + '，上香 ' + chunk.price + ' 炷。')
+                                    : ('上香 ' + chunk.price + ' 炷。'));
+                            }
+                        } else if (chunk.type === 'error') {
+                            gotError = true;
+                            setChatStatus('');
+                            assistantEl.textContent = chunk.message || '回复失败，请稍后重试。';
+                        }
+                    }
+                }
+                setChatStatus('');
+                if (gotError) {
+                    chatRetryPayload = null;  // 服务端已退款，重发=新一轮，重新生成 request_id
+                    loadChatQuota();
+                } else if (gotDone) {
+                    chatRetryPayload = null;  // 已收到终稿，重试入口关闭
+                } else {
+                    // 流关闭但无 done/error：按中断处理
+                    if (!assistantEl.textContent) removeBubble(assistantEl);
+                    showChatRetryError();
+                }
+            } catch (e) {
+                setChatStatus('');
+                if (!assistantEl.textContent) removeBubble(assistantEl);
+                showChatRetryError();
+            } finally {
+                setChatStreaming(false);
             }
         }
 
@@ -2953,6 +3755,9 @@ INDEX_HTML = r'''
                 displayResult(result);
                 currentResultData = result;
                 loadHistory();
+
+                // chat 追问区随新盘打开（history_id 由 /api/paipan 回传）
+                openChat(result.history_id);
 
                 // 滚动引导
                 setTimeout(() => {
