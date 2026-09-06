@@ -19,3 +19,6 @@
 - P4-UI 仍遵循“最大感知变化，最小技术改动”：保留 Flask inline 前端和既有 DOM/JS 契约，不在发码内测前切 React，避免把风险扩大到构建链路和路由迁移。
 - ChatDeepSeek 接 DeepSeek V4 时若不显式传 `thinking: disabled`，流式事件会先出现 `additional_kwargs.reasoning_content`，正文 `content` 可能为空直到输出预算打满；追问链路应显式关闭 thinking，且继续禁止 reasoning 外发。
 - `/api/chat` 的完成语义必须要求 `reply_text.strip()` 非空；空回复即使有 token usage 也只能记为 `empty_reply`、退款、不给幂等缓存和 helpful 入口。
+- 服务器旧目录 `/home/ubuntu/xuanjige` 不是 Git 仓库；上线应采用 release 目录克隆 GitHub、复制旧 `.env`、并固定 `docker compose -p xuanjige`，否则容易误建新 volumes 或覆盖生产配置。
+- 生产服务对 C 端页面的最低反向检查是：公网首页必须包含用户侧 `命盘咨询间` 与空回复保护文案，不应出现 Agent Console、grounding、chunk_id、P4 指标等工程词。
+- 服务器位于国内网络时，Docker 构建直接访问 PyPI 可能极慢；下一轮部署优化可以考虑在 Dockerfile/compose 中加入可选 `PIP_INDEX_URL` build arg，而不是把镜像源硬编码进应用逻辑。

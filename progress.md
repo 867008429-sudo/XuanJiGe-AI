@@ -39,3 +39,10 @@
 - 本地数据修复：删除 `acct:4:23` 下 2 条历史空 `chat_requests` 及对应 feedback，保留 usage logs 作为事故审计线索；当前本地空回复缓存数为 0。
 - 对抗性审查：reasoning 不外发、工具 JSON 不外发、空回复不可评价/不可回放、普通用户退款、超级账号保持无限额度、旧空缓存不会再显示计香/反馈入口。
 - 定向验证：`py_compile chat_graph.py app.py tests/test_chat_graph.py tests/test_chat_route.py tests/test_frontend_persona_contract.py` 通过；chat_graph/chat_route/chat_db/frontend/chat_feedback 共 118 项通过；真实掌门档 smoke 返回非空正文且 `reasoning_seen=False`；重启后本地 `/api/chat` 端到端返回 15 个 token 片段和 `done`。
+- GitHub 发布：提交 `1319887 feat: build agent consultation loop` 已推送到 `origin/main`，远端 `refs/heads/main` 与本地 HEAD 一致。
+- 上线前验证：显式测试入口 `python -m unittest discover -s tests -p "test_*.py"` 共 210 项通过；`tools/preflight.py` required checks 通过，只有 `ADMIN_TOKEN` 未配置的 optional warn；staged/仓库敏感信息扫描未发现 GitHub PAT 或 API key。
+- 服务器部署尝试：公网 `129.204.102.108:8888` 与 22 端口可达，`/health` 正常，但当前本机没有 SSH 私钥/ssh-agent/SSH config；`ubuntu/root/lighthouse@129.204.102.108` 均返回 `Permission denied (publickey,password)`，远端页面尚未包含本次 `命盘咨询间`/空回复保护文案。
+- 服务器部署完成：使用用户提供的临时 SSH 密码登录 `ubuntu@129.204.102.108`，保留旧目录 `/home/ubuntu/xuanjige` 与 `.env`，从 GitHub 克隆最新代码到 `/home/ubuntu/xuanjige_release`，并用 `docker compose -p xuanjige up -d --build` 复用既有 `xuanjige_*` volumes。
+- 上线版本验证：服务器 release HEAD 为 `1319887cc4c11f8852361836b7485ceb0e572235`；容器 `xuanjige` `running healthy`、重启次数 0；公网 `/health`、`/api/auth-config` 均返回 200，首页已包含 `命盘咨询间`、空回复保护文案和超级账号文案。
+- 服务器对抗性审查：容器内关键文件 `chat_graph.py/chat_audit.py/chat_cleanup.py/data/classics` 均存在；定向 `py_compile` 通过；运行时 checks 为 `ok`，`admin_stats` 仍因未配置 `ADMIN_TOKEN` 处于 optional disabled；最近日志无启动异常，只有外部扫描 `/admin/config.php` 的 404。
+- 服务器超级账号：服务端创建/更新 `xjg_super_test` 超级测试账号；API smoke 验证登录 200、`/api/quota` 返回 `unlimited=true`、新建测试命盘后 `/api/chat/quota` 返回 `quota_left=999999999`，真实 `/api/chat` SSE 返回非空正文并 `done`，测试命盘已删除。
