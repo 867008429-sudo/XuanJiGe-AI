@@ -18,7 +18,6 @@ SECRET_PATTERNS = [
     re.compile(r'github_' + r'pat_[A-Za-z0-9_]+'),
     re.compile(r'DEEPSEEK_API_KEY\s*=\s*sk-(?!your-key-here)[A-Za-z0-9_-]+'),
     re.compile('Aa' + '867008429' + '!'),
-    re.compile(r'129\.204\.102\.108'),
 ]
 
 

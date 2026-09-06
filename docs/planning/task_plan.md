@@ -21,9 +21,10 @@
 2. P4-UI 已完成用户侧修订：保留 Flask inline 前端与原有 ID/函数契约，把页面改成左侧建盘/历史、中间继续追问、底部咨询说明的命盘咨询间；不在用户可见界面暴露运行面板、grounding、chunk_id 或 P4 指标。
 3. P4-chat 空回复事故已修复：chat 模型显式关闭 thinking、空回复退款不落库、前端不对空回复挂 helpful，且已清理本地 `acct:4:23` 的空回复缓存。
 4. P4 代码已发布并上线到公网 `129.204.102.108:8888`：GitHub `origin/main` 与服务器 release 均为 `1319887cc4c11f8852361836b7485ceb0e572235`，服务器容器 healthy，真实 `/api/chat` SSE 非空。
-5. 进入 P4-2：用现有 `tools/manage_invite_codes.py` 生成 50-100 个体验码，保留“邀请制内测”口径。
-6. 增加 P4 运营记录：真实追问会话数、helpful 反馈数、误导抽审率，避免简历/README 造数。
-7. 后续统一跑 full unittest、preflight、diff check、PAT 扫描与 smoke；服务器 Docker 已完成一次公网复验。
+5. GitHub 仓库整理完成：根目录瘦身，README 更新为干净项目首页并加入公网体验地址，内部计划/进度/长文档统一进入 `docs/`。
+6. 进入 P4-2：用现有 `tools/manage_invite_codes.py` 生成 50-100 个体验码，保留“邀请制内测”口径。
+7. 增加 P4 运营记录：真实追问会话数、helpful 反馈数、误导抽审率，避免简历/README 造数。
+8. 仓库整理收尾验证已完成：`.venv` 下 full unittest 210 项通过，preflight required checks 通过，diff check 仅 Windows 行尾提示，PAT/API key/SSH 密码扫描无命中。
 
 ## 遇到的错误
 
@@ -38,3 +39,4 @@
 | 直接假设 SQLite 表含 `accounts.fingerprint` 或 `sessions.id` | 1 | 读取 schema 后改用 `acct:<account_id>` 与 `sessions.expires_at` |
 | 服务器 Docker 构建从 PyPI 下载依赖过慢 | 1 | 保持构建不中断直到完成；后续可考虑给 Dockerfile 增加可配置 pip 镜像源/缓存策略 |
 | 容器内完整 `tools/preflight.py` 执行挂住 | 1 | 中断只读预检，改用带超时的 `py_compile`、运行时 checks、HTTP 与日志检查 |
+| 本机系统 Python 未安装 Flask，直接跑 `tools/preflight.py` 失败 | 1 | 改用项目 `.venv\Scripts\python.exe` 复跑，preflight required checks 通过 |

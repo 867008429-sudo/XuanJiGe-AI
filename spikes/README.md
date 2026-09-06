@@ -1,6 +1,6 @@
 # P0 Spike 验证报告
 
-> 对应方案：`agent-plan.md` v4.1 第 4 节（P0 技术验证）
+> 对应方案：`docs/plans/agent-plan.md` v4.1 第 4 节（P0 技术验证）
 > 基线仓库：main @ 981e880（Flask + gunicorn 2x gevent + SQLite + DeepSeek）
 > 结论先行：**Go —— 6 项验证全绿（39/40 断言通过），P1 可以开工。**
 > 唯一未过项（OpenAI 域名连通）为沙箱出口策略限制，非工程问题，协议层已用等价方式验证，见 §5。

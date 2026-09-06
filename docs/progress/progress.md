@@ -46,3 +46,7 @@
 - 上线版本验证：服务器 release HEAD 为 `1319887cc4c11f8852361836b7485ceb0e572235`；容器 `xuanjige` `running healthy`、重启次数 0；公网 `/health`、`/api/auth-config` 均返回 200，首页已包含 `命盘咨询间`、空回复保护文案和超级账号文案。
 - 服务器对抗性审查：容器内关键文件 `chat_graph.py/chat_audit.py/chat_cleanup.py/data/classics` 均存在；定向 `py_compile` 通过；运行时 checks 为 `ok`，`admin_stats` 仍因未配置 `ADMIN_TOKEN` 处于 optional disabled；最近日志无启动异常，只有外部扫描 `/admin/config.php` 的 404。
 - 服务器超级账号：服务端创建/更新 `xjg_super_test` 超级测试账号；API smoke 验证登录 200、`/api/quota` 返回 `unlimited=true`、新建测试命盘后 `/api/chat/quota` 返回 `quota_left=999999999`，真实 `/api/chat` SSE 返回非空正文并 `done`，测试命盘已删除。
+- GitHub 仓库整理：根目录保留代码、部署、测试与数据入口；长技术 README 保留到 `docs/technical-overview.md`，计划/进度移入 `docs/plans`、`docs/planning`、`docs/progress`，spike 报告移入 `spikes/README.md`。
+- README 重写：新增干净项目首页，放入公网体验地址 `http://129.204.102.108:8888/`、项目亮点、仓库结构、快速启动、Docker 部署、常用命令、API 概览和文档索引。
+- 对抗性审查：公网 Demo 地址是用户要求公开的 README 信息，因此从 `tools/preflight.py` 的敏感信息扫描中移除固定 IP 检查；PAT/API key/SSH 密码/超级账号密码仍继续扫描与禁止入库。
+- 仓库整理验证：`py_compile` 通过；`.venv` 下 `tools/preflight.py` required checks 通过，仅 `ADMIN_TOKEN` 未配置为 optional warn；full unittest 210 项通过；敏感信息扫描无 GitHub PAT/API key/SSH 密码；`git diff --check` 仅 Windows 行尾提示。

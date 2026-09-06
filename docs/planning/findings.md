@@ -22,3 +22,4 @@
 - 服务器旧目录 `/home/ubuntu/xuanjige` 不是 Git 仓库；上线应采用 release 目录克隆 GitHub、复制旧 `.env`、并固定 `docker compose -p xuanjige`，否则容易误建新 volumes 或覆盖生产配置。
 - 生产服务对 C 端页面的最低反向检查是：公网首页必须包含用户侧 `命盘咨询间` 与空回复保护文案，不应出现 Agent Console、grounding、chunk_id、P4 指标等工程词。
 - 服务器位于国内网络时，Docker 构建直接访问 PyPI 可能极慢；下一轮部署优化可以考虑在 Dockerfile/compose 中加入可选 `PIP_INDEX_URL` build arg，而不是把镜像源硬编码进应用逻辑。
+- GitHub 根目录对外门面应只放运行入口和核心资产；计划、进度、spike、技术长文属于 `docs/`/`spikes/`，否则招聘方或用户第一眼会误判项目是内部工作台而非可体验产品。
