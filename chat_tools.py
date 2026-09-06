@@ -6,8 +6,8 @@
 2. 工具通过闭包绑定当前命盘（birth/day gan 等），模型侧只传查询参数。
 3. 工具失败不抛异常给框架，而是包装成中文 Observation 回传，
    agent 自行换路或如实告知用户；额度退款走 /api/chat 的 finally 分支。
-4. lookup_classics 是 RAG 轨道（search_classics）的 P1 占位实现：
-   字典查表 + "查无此条"必须如实回答，为 R3 grounding 行为提前定调。
+4. search_classics 是 RAG 轨道的 R3 工具入口：
+   本地检索 R1 语料，返回可回验 chunk_id；查无此文时禁止编造古籍原文。
 """
 import datetime
 import logging
@@ -16,7 +16,7 @@ import re
 from langchain_core.tools import tool
 
 import bazi_engine
-import bazi_knowledge
+import classics_search
 
 logger = logging.getLogger('xuanjige.chat.tools')
 
@@ -29,6 +29,15 @@ _NAME_COLLAPSE = re.compile(r'[-·]{2,}')
 
 NAME_MAX_LEN = 16
 EMPTY_NAME_TEXT = '未留姓名'
+
+SEARCH_CLASSICS_VERSION = 'classics-r2-bm25-v1'
+SEARCH_CLASSICS_MIN_SCORE = 10.0
+SEARCH_CLASSICS_SHORT_QUERY_MIN_SCORE = 5.0
+SEARCH_CLASSICS_MAX_K = 5
+RAG_RISKY_CLAIM_FRAGMENTS = (
+    '稳赚不赔', '包赚', '保证发财', '必定发财', '一定暴富',
+    '必然离婚', '一定离婚', '必离', '确诊', '诊断为', '你患有',
+)
 
 
 def sanitize_name(name):
@@ -77,55 +86,48 @@ def _safe_call(fn, tool_name):
         return '工具调用失败：当前数据暂不可用。请换一种查询方式，或如实告知用户该数据暂时取不到。'
 
 
-def _lookup_classics_impl(topic):
-    topic = str(topic or '').strip()
-    if not topic:
-        return '查询主题为空。请给出具体的命理概念（如十神、格局、五行、地支关系）。'
+def _search_min_score(query):
+    compact = ''.join(re.findall(r'[\u4e00-\u9fffA-Za-z0-9]+', str(query or '')))
+    return SEARCH_CLASSICS_SHORT_QUERY_MIN_SCORE if len(compact) <= 3 else SEARCH_CLASSICS_MIN_SCORE
 
-    matched = []
 
-    def _match(key, hint, trigger):
-        if key in topic or str(hint.get('topic', '')) in topic:
-            matched.append((key, hint, trigger))
-
-    for key, hint in bazi_knowledge.TEN_GOD_HINTS.items():
-        _match(key, hint, key)
-    for key, hint in bazi_knowledge.STRENGTH_HINTS.items():
-        _match(key, hint, key)
-    for key, hint in bazi_knowledge.GEJU_HINTS.items():
-        _match(key, hint, key)
-    for key, hint in bazi_knowledge.RELATION_HINTS.items():
-        _match(key, hint, f'地支{key}')
-    for key, hint in bazi_knowledge.WUXING_HINTS.items():
-        # 裸五行字（"火"）与组合词（"金旺""木性"）都可命中
-        if key in topic or f'{key}旺' in topic or f'{key}弱' in topic or f'{key}性' in topic:
-            matched.append((key, hint, f'{key}五行'))
-
-    if not matched:
-        allowed = '、'.join(bazi_knowledge.ALLOWED_CLASSIC_BOOKS)
+def _search_classics_impl(query, k=4):
+    query = str(query or '').strip()
+    if not query:
+        return '查询主题为空。请给出具体的命理概念、古籍篇名或原文关键词。'
+    if any(fragment in query for fragment in RAG_RISKY_CLAIM_FRAGMENTS):
         return (
-            f'查无此条：知识库（{bazi_knowledge.KNOWLEDGE_VERSION}）未收录「{topic[:24]}」相关内容。'
-            f'允许署名的书目仅有：{allowed}。此主题查无此文，不得编造原文。'
+            f'查无此文：古籍语料库（{SEARCH_CLASSICS_VERSION}）不为「{query[:24]}」'
+            '这类绝对化、医疗化或投资保证表达提供出处。必须如实告知查无此文，不得编造原文。'
+        )
+
+    try:
+        limit = int(k)
+    except (TypeError, ValueError):
+        limit = 4
+    limit = max(1, min(limit, SEARCH_CLASSICS_MAX_K))
+
+    min_score = _search_min_score(query)
+    hits = [
+        hit for hit in classics_search.search_classics(query, k=limit)
+        if float(hit.get('score') or 0) >= min_score
+    ]
+    if not hits:
+        return (
+            f'查无此文：古籍语料库（{SEARCH_CLASSICS_VERSION}）未命中「{query[:24]}」。'
+            '必须如实告知查无可靠出处，禁止编造古籍原文、卷页、作者或 chunk_id。'
         )
 
     lines = [
-        f'命中 {len(matched)} 条（{bazi_knowledge.KNOWLEDGE_VERSION}，以下为义理参考，非古籍逐字原文，可署书名）：'
+        f'命中 {len(hits)} 条（{SEARCH_CLASSICS_VERSION}）。'
+        '若引用古籍原文或篇名，必须使用返回的 chunk_id，格式如【ditiansui-chanwei-ch029】。'
     ]
-    for idx, (key, hint, trigger) in enumerate(matched[:4], 1):
-        if 'balanced' in hint:  # 五行条目是三档结构，无 meaning/advice 键
-            body = (
-                f'五行倾向：{hint["balanced"]}；偏旺时：{hint["too_high"]}；偏弱时：{hint["too_low"]}'
-                '；只作生活节奏提醒，不作疾病判断。'
-            )
-        else:
-            body = f'义理={hint["meaning"]}'
-            if hint.get('advice'):
-                body += f'；现实建议：{hint["advice"]}'
+    for idx, hit in enumerate(hits, 1):
         lines.append(
-            f'{idx}. 触发={trigger}；主题={hint["topic"]}；{body}；可署书名={hint["book"]}'
+            f'{idx}. chunk_id={hit["chunk_id"]}；可引用格式=【{hit["chunk_id"]}】；'
+            f'书名=《{hit["book"]}》；篇名={hit["chapter_title"]}；'
+            f'命中词={",".join(hit.get("matched_terms") or [])}；摘录={hit["excerpt"]}'
         )
-    if len(matched) > 4:
-        lines.append(f'（另有 {len(matched) - 4} 条未列出，可缩小主题再查。）')
     return '\n'.join(lines)
 
 
@@ -139,7 +141,7 @@ def _query_liunian_impl(year, day_gan):
     return (
         f'{year}年 流年柱 {gan}{zhi}；年干{gan}对日主{day_gan}为{sh}；'
         f'该年6月（芒种后）月柱参考 {mgan}{mzhi}。'
-        '十神含义可另行调用 lookup_classics 查询。'
+        '十神含义可另行调用 search_classics 查询。'
     )
 
 
@@ -223,10 +225,11 @@ def build_chat_tools(paipan_data):
         return _safe_call(lambda: _query_dayun_impl(start_age, paipan_data), 'query_dayun')
 
     @tool
-    def lookup_classics(topic: str) -> str:
-        """按命理主题查询古籍义理知识库（十神/格局/旺衰/五行/地支关系）。
-        返回可署书名的义理参考。查无此条时会明确告知，此时必须如实回答"查无此文"，禁止编造古籍原文。"""
-        return _safe_call(lambda: _lookup_classics_impl(topic), 'lookup_classics')
+    def search_classics(query: str, k: int = 4) -> str:
+        """检索 R1 古籍原文语料，返回可回验的 chunk_id、书名、篇名和摘录。
+        适合回答"某古籍原文怎么说/某命理概念出处在哪里"类问题。
+        查无此文时必须如实告知，禁止编造古籍原文、卷页、作者或 chunk_id。"""
+        return _safe_call(lambda: _search_classics_impl(query, k), 'search_classics')
 
     @tool
     def query_paipan(birth: dict) -> str:
@@ -235,4 +238,4 @@ def build_chat_tools(paipan_data):
         其中 hour/minute/gender 可缺省。只返回简要四柱信息。"""
         return _safe_call(lambda: _query_paipan_impl(birth), 'query_paipan')
 
-    return [query_liunian, query_dayun, lookup_classics, query_paipan]
+    return [query_liunian, query_dayun, search_classics, query_paipan]

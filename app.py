@@ -23,6 +23,7 @@ import json
 import time as _time
 import hmac
 import logging
+import threading
 from pathlib import Path
 
 def _load_env_fallback(path='.env'):
@@ -50,6 +51,7 @@ import db
 import ai_service
 from bazi_engine import paipan
 from chat_personas import DEFAULT_PERSONA_ID, PERSONAS, PERSONA_LIST, get_persona
+from ai_validator import RISKY_PHRASES
 
 
 def _csv_env(name):
@@ -74,6 +76,10 @@ REGISTRATION_DAILY_MAX_PER_CLIENT = int(os.environ.get('REGISTRATION_DAILY_MAX_P
 ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '').strip()
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 LOG_FILE = os.environ.get('LOG_FILE', '').strip()
+CHAT_CLEANUP_ENABLED = os.environ.get('CHAT_CLEANUP_ENABLED', '0') == '1'
+CHAT_CLEANUP_RETENTION_DAYS = int(os.environ.get('CHAT_CLEANUP_RETENTION_DAYS', '30'))
+CHAT_CLEANUP_INTERVAL_SECONDS = int(os.environ.get('CHAT_CLEANUP_INTERVAL_SECONDS', str(24 * 60 * 60)))
+CHAT_CLEANUP_INITIAL_DELAY_SECONDS = int(os.environ.get('CHAT_CLEANUP_INITIAL_DELAY_SECONDS', '300'))
 
 
 def configure_logging():
@@ -429,6 +435,8 @@ def api_interpret():
     if quota_result is None:
         return jsonify({'error': '登录已过期，请重新登录', 'need_login': True}), 401
     can_use, free_remaining, is_free = quota_result
+    account = db.get_account_by_token(auth_token)
+    quota_unlimited = bool(account and db.is_superuser_account(account))
 
     if not can_use and not legacy_refresh:
         return jsonify({
@@ -493,6 +501,7 @@ def api_interpret():
             'X-Free-Remaining': str(free_remaining),
             'X-Is-Free': str(is_free or legacy_refresh).lower(),
             'X-Cache-Refresh': str(legacy_refresh).lower(),
+            'X-Unlimited-Quota': str(quota_unlimited).lower(),
         }
     )
 
@@ -505,7 +514,7 @@ def api_quota():
     account = db.get_account_by_token(auth_token)
     if account:
         free_remaining = max(0, 5 - account['free_trials_used'])
-        return jsonify({
+        body = {
             'can_use': free_remaining > 0 or (account['credits'] or 0) > 0,
             'free_remaining': free_remaining,
             'free_total': 5,
@@ -513,7 +522,15 @@ def api_quota():
             'logged_in': True,
             'username': account['username'],
             'credits': account['credits'] or 0,
-        })
+        }
+        if db.is_superuser_account(account):
+            body.update({
+                'can_use': True,
+                'is_free': True,
+                'is_superuser': True,
+                'unlimited': True,
+            })
+        return jsonify(body)
     # 未登录，用指纹配额
     fingerprint = get_fingerprint(request)
     can_use, free_remaining, is_free = db.check_quota(fingerprint)
@@ -621,13 +638,19 @@ def api_me():
     token = get_auth_token(request)
     account = db.get_account_by_token(token)
     if account:
-        return jsonify({
+        body = {
             'logged_in': True,
             'username': account['username'],
             'free_remaining': max(0, 5 - account['free_trials_used']),
             'free_total': 5,
             'credits': account['credits'] or 0,
-        })
+        }
+        if db.is_superuser_account(account):
+            body.update({
+                'is_superuser': True,
+                'unlimited': True,
+            })
+        return jsonify(body)
     # 未登录，返回匿名用户配额
     fingerprint = get_fingerprint(request)
     can_use, free_remaining, is_free = db.check_quota(fingerprint)
@@ -695,6 +718,103 @@ def api_history_delete(hid):
 CHAT_MAX_INPUT_CHARS = int(os.environ.get('CHAT_MAX_INPUT_CHARS', '500'))
 CHAT_REQUEST_ID_MAX_LEN = 64
 CHAT_PERSONA_ID_MAX_LEN = 32  # persona 白名单键长度上限（防御超长垃圾输入）
+CHAT_SAFETY_FALLBACK = (
+    '这类话题不能下绝对断语。这里只按传统命理作参考提醒，'
+    '不替代医疗、投资、婚姻等重大决定。'
+)
+CHAT_GROUNDING_FALLBACK = (
+    '这条古籍引用没有通过出处校验。这里必须按“查无可靠出处”处理，'
+    '不能编造古籍原文或引用编号。'
+)
+CHAT_EMPTY_REPLY_MESSAGE = '刚才没有收到有效回复，香火已退回，请重新追问。'
+
+
+def _chat_risky_phrase(text):
+    """返回流式输出中命中的危险短语；未命中返回空串。"""
+    content = str(text or '')
+    for phrase in RISKY_PHRASES:
+        if phrase in content:
+            return phrase
+    return ''
+
+
+def _split_chat_safety_buffer(buffer):
+    """拆出可安全外发的前缀，保留可能组成危险短语或 chunk_id 的尾巴。
+
+    例：模型分两段吐出“稳赚” + “不赔”时，第一段会被暂存在尾巴里；
+    第二段到达后命中完整“稳赚不赔”，因此完整危险短语不会外发。
+    另保留未闭合的 `【...`，避免 chunk_id 分片时半截 citation 先外发。
+    """
+    text = str(buffer or '')
+    max_tail = min(len(text), max(len(p) for p in RISKY_PHRASES) - 1)
+    keep = 0
+    for size in range(max_tail, 0, -1):
+        suffix = text[-size:]
+        if any(p.startswith(suffix) for p in RISKY_PHRASES):
+            keep = size
+            break
+    keep_start = len(text) - keep if keep else len(text)
+    last_open = text.rfind('【')
+    last_close = text.rfind('】')
+    if last_open > last_close:
+        keep_start = min(keep_start, last_open)
+    return text[:keep_start], text[keep_start:]
+
+
+def _chat_ungrounded_chunk_id(text, retrieved_chunk_ids, extract_chunk_ids):
+    retrieved = {str(item).lower() for item in (retrieved_chunk_ids or [])}
+    for chunk_id in extract_chunk_ids(text):
+        if chunk_id not in retrieved:
+            return chunk_id
+    return ''
+
+
+def _chat_usage_tokens_from_event(event):
+    """从 LangChain stream event 中提取 token 用量；没有则返回 None。"""
+    if not (isinstance(event, tuple) and len(event) == 2):
+        return None
+    usage = getattr(event[0], 'usage_metadata', None)
+    if not isinstance(usage, dict):
+        return None
+
+    def as_int(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    prompt_tokens = as_int(usage.get('input_tokens', usage.get('prompt_tokens', 0)))
+    completion_tokens = as_int(usage.get('output_tokens', usage.get('completion_tokens', 0)))
+    total_tokens = as_int(usage.get('total_tokens', prompt_tokens + completion_tokens))
+    if not total_tokens and (prompt_tokens or completion_tokens):
+        total_tokens = prompt_tokens + completion_tokens
+    if not (prompt_tokens or completion_tokens or total_tokens):
+        return None
+    return {
+        'prompt_tokens': prompt_tokens,
+        'completion_tokens': completion_tokens,
+        'total_tokens': total_tokens,
+    }
+
+
+def _merge_chat_usage_tokens(current, update):
+    """合并 usage_metadata：DeepSeek/OpenAI 流通常末包给累计值，取最大值防双计。"""
+    if not update:
+        return current
+    for key in ('prompt_tokens', 'completion_tokens', 'total_tokens'):
+        current[key] = max(int(current.get(key, 0) or 0), int(update.get(key, 0) or 0))
+    return current
+
+
+def _log_chat_usage_safe(**kwargs):
+    """Best-effort chat 观测日志；失败不能影响用户侧流式响应。"""
+    try:
+        db.log_chat_usage(**kwargs)
+    except Exception:  # noqa: BLE001 观测失败不能拖垮主链路
+        logger.exception(
+            'chat usage log failed: thread=%s request=%s',
+            kwargs.get('thread_id'), kwargs.get('request_id'),
+        )
 
 
 def _chat_auth():
@@ -782,26 +902,45 @@ def api_chat():
         return jsonify({'error': '记录不存在', 'message': '命盘不存在或不属于当前账号'}), 404
 
     thread_id = db.build_chat_thread_id(fingerprint, hid)
+    quota_unlimited = db.is_superuser_fingerprint(fingerprint)
     name = detail.get('name', '')
 
     # --- 幂等回放：同 (thread, request_id) 已答过只回放，绝不改写历史回复 ---
     cached = db.get_chat_reply(thread_id, request_id)
     if cached:
+        replay_quota_left = (
+            db.get_chat_quota_left(hid, fingerprint)
+            if quota_unlimited else cached['quota_left']
+        )
         db.log_usage(fingerprint, '/api/chat', True, 0, 0)
+        _log_chat_usage_safe(
+            fingerprint=fingerprint,
+            hid=hid,
+            thread_id=thread_id,
+            request_id=request_id,
+            persona=cached['persona'],
+            price=cached['price'],
+            quota_left=replay_quota_left,
+            cached=True,
+            status='replay',
+        )
 
         def replay_stream():
             for chunk_text in _split_reply_text(cached['reply_text']):
                 yield chat_graph_dump_sse({'type': 'token', 'text': chunk_text})
             # 回放带当时的 price 与 persona（persona-plan §5.3）：
             # 回放的是当时那位道长的回复，账目字段如实还原
-            yield chat_graph_dump_sse({
+            done_event = {
                 'type': 'done',
-                'quota_left': cached['quota_left'],
+                'quota_left': replay_quota_left,
                 'price': cached['price'],
                 'persona': cached['persona'],
                 'request_id': request_id,
                 'cached': True,
-            })
+            }
+            if quota_unlimited:
+                done_event['unlimited'] = True
+            yield chat_graph_dump_sse(done_event)
 
         return Response(
             replay_stream(),
@@ -809,8 +948,9 @@ def api_chat():
             headers={
                 'Cache-Control': 'no-cache',
                 'X-Accel-Buffering': 'no',
-                'X-Quota-Left': str(cached['quota_left']),
+                'X-Quota-Left': str(replay_quota_left),
                 'X-Cache-Hit': 'true',
+                'X-Unlimited-Quota': str(quota_unlimited).lower(),
             },
         )
 
@@ -830,11 +970,21 @@ def api_chat():
         return jsonify({'error': '服务暂不可用', 'message': 'AI 服务未配置，请稍后再试'}), 503
 
     # --- 原子扣减香火（gate 语义；并发不可能双花，见 db.consume_chat_quota） ---
-    # 扣减价 = 该道长注册表定价；不传 persona 的旧客户端按缺省道长 2 炷计价，
-    # 用户可见行为与旧"每盘 5 次追问"等价（10 炷 ÷ 2，persona-plan §3）。
+    # 扣减价 = 该道长注册表定价；不传 persona 的旧客户端按缺省清虚 2 炷计价，
+    # 10 炷香火可请教 5 轮默认档，保持升级前可用轮数不缩水（persona-plan §3）。
     ok, used = db.consume_chat_quota(hid, fingerprint, persona.price_incense)
-    quota_left = max(0, db.CHAT_FREE_INCENSE - used)
+    quota_left = db.get_chat_quota_left(hid, fingerprint)
     if not ok:
+        _log_chat_usage_safe(
+            fingerprint=fingerprint,
+            hid=hid,
+            thread_id=thread_id,
+            request_id=request_id,
+            persona=persona.persona_id,
+            price=persona.price_incense,
+            quota_left=quota_left,
+            status='quota_exhausted',
+        )
         # 403 带明细（persona-plan §5.2）：用户失败得明白——差几炷、该道长几炷
         return jsonify({
             'error': '香火不足',
@@ -849,6 +999,15 @@ def api_chat():
     # --- 流式生成 ---
     def generate():
         reply_text = ''
+        safety_buffer = ''
+        retrieved_chunk_ids = set()
+        tool_calls = 0
+        safety_triggered = False
+        usage_tokens = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0,
+        }
         try:
             stream = graph.stream(
                 {
@@ -861,26 +1020,161 @@ def api_chat():
                 stream_mode='messages',
             )
             for event in stream:
+                retrieved_chunk_ids.update(chat_graph.extract_retrieved_chunk_ids(event))
+                _merge_chat_usage_tokens(
+                    usage_tokens,
+                    _chat_usage_tokens_from_event(event),
+                )
                 payload = chat_graph.parse_stream_event(event)
-                if payload:
+                if not payload:
+                    continue
+                if payload.get('type') != 'token':
+                    if payload.get('type') == 'tool':
+                        tool_calls += 1
                     yield chat_graph_dump_sse(payload)
-                    if payload.get('type') == 'token':
-                        reply_text += payload.get('text', '')
+                    continue
+
+                safety_buffer += payload.get('text', '')
+                risky_phrase = _chat_risky_phrase(safety_buffer)
+                if risky_phrase:
+                    safety_triggered = True
+                    logger.warning(
+                        'chat safety fuse tripped: thread=%s request=%s phrase=%s',
+                        thread_id, request_id, risky_phrase,
+                    )
+                    reply_text += CHAT_SAFETY_FALLBACK
+                    yield chat_graph_dump_sse({
+                        'type': 'token',
+                        'text': CHAT_SAFETY_FALLBACK,
+                    })
+                    safety_buffer = ''
+                    break
+
+                ungrounded_chunk_id = _chat_ungrounded_chunk_id(
+                    safety_buffer, retrieved_chunk_ids, chat_graph.extract_chunk_ids,
+                )
+                if ungrounded_chunk_id:
+                    safety_triggered = True
+                    logger.warning(
+                        'chat grounding fuse tripped: thread=%s request=%s chunk_id=%s',
+                        thread_id, request_id, ungrounded_chunk_id,
+                    )
+                    reply_text += CHAT_GROUNDING_FALLBACK
+                    yield chat_graph_dump_sse({
+                        'type': 'token',
+                        'text': CHAT_GROUNDING_FALLBACK,
+                    })
+                    safety_buffer = ''
+                    break
+
+                safe_text, safety_buffer = _split_chat_safety_buffer(safety_buffer)
+                if safe_text:
+                    reply_text += safe_text
+                    yield chat_graph_dump_sse({'type': 'token', 'text': safe_text})
+
+            if safety_buffer:
+                reply_text += safety_buffer
+                yield chat_graph_dump_sse({'type': 'token', 'text': safety_buffer})
+                safety_buffer = ''
+
+            grounding = chat_graph.validate_grounded_citations(reply_text, retrieved_chunk_ids)
+            if not safety_triggered and not grounding['ok']:
+                safety_triggered = True
+                logger.warning(
+                    'chat grounding validation failed: thread=%s request=%s missing=%s',
+                    thread_id, request_id, ','.join(grounding['missing_chunk_ids']),
+                )
+                reply_text = CHAT_GROUNDING_FALLBACK
+                yield chat_graph_dump_sse({
+                    'type': 'token',
+                    'text': CHAT_GROUNDING_FALLBACK,
+                })
+
+            if not reply_text.strip():
+                logger.warning(
+                    'chat empty reply: thread=%s request=%s prompt_tokens=%s completion_tokens=%s',
+                    thread_id, request_id,
+                    usage_tokens['prompt_tokens'], usage_tokens['completion_tokens'],
+                )
+                db.refund_chat_quota(hid, fingerprint, persona.price_incense)
+                quota_left_after_refund = db.get_chat_quota_left(hid, fingerprint)
+                cost_usd = ai_service.calc_cost(
+                    usage_tokens['prompt_tokens'],
+                    usage_tokens['completion_tokens'],
+                ) if usage_tokens['total_tokens'] else 0
+                if usage_tokens['total_tokens']:
+                    db.log_usage(
+                        fingerprint, '/api/chat', False,
+                        usage_tokens['total_tokens'], cost_usd,
+                    )
+                _log_chat_usage_safe(
+                    fingerprint=fingerprint,
+                    hid=hid,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    persona=persona.persona_id,
+                    price=persona.price_incense,
+                    quota_left=quota_left_after_refund,
+                    status='empty_reply',
+                    tool_calls=tool_calls,
+                    safety_triggered=safety_triggered,
+                    prompt_tokens=usage_tokens['prompt_tokens'],
+                    completion_tokens=usage_tokens['completion_tokens'],
+                    total_tokens=usage_tokens['total_tokens'],
+                    cost_usd=cost_usd,
+                    error_type='EmptyReply',
+                )
+                error_event = {
+                    'type': 'error',
+                    'message': CHAT_EMPTY_REPLY_MESSAGE,
+                    'quota_left': quota_left_after_refund,
+                }
+                if quota_unlimited:
+                    error_event['unlimited'] = True
+                yield chat_graph_dump_sse(error_event)
+                return
 
             # 正常完成：落幂等表，此后同 request_id 重发只回放
             db.save_chat_reply(
                 thread_id, request_id, reply_text, quota_left,
                 persona.price_incense, persona.persona_id,
+                retrieved_chunk_ids=sorted(retrieved_chunk_ids),
             )
-            db.log_usage(fingerprint, '/api/chat', False, 0, 0)
-            yield chat_graph_dump_sse({
+            cost_usd = ai_service.calc_cost(
+                usage_tokens['prompt_tokens'],
+                usage_tokens['completion_tokens'],
+            ) if usage_tokens['total_tokens'] else 0
+            db.log_usage(
+                fingerprint, '/api/chat', False,
+                usage_tokens['total_tokens'], cost_usd,
+            )
+            _log_chat_usage_safe(
+                fingerprint=fingerprint,
+                hid=hid,
+                thread_id=thread_id,
+                request_id=request_id,
+                persona=persona.persona_id,
+                price=persona.price_incense,
+                quota_left=quota_left,
+                status='safety' if safety_triggered else 'ok',
+                tool_calls=tool_calls,
+                safety_triggered=safety_triggered,
+                prompt_tokens=usage_tokens['prompt_tokens'],
+                completion_tokens=usage_tokens['completion_tokens'],
+                total_tokens=usage_tokens['total_tokens'],
+                cost_usd=cost_usd,
+            )
+            done_event = {
                 'type': 'done',
                 'quota_left': quota_left,
                 'price': persona.price_incense,
                 'persona': persona.persona_id,
                 'request_id': request_id,
                 'cached': False,
-            })
+            }
+            if quota_unlimited:
+                done_event['unlimited'] = True
+            yield chat_graph_dump_sse(done_event)
         except GeneratorExit:
             # 客户端断开：模型调用已实际消耗。已吐出部分文本则落库
             # （重发同 request_id 回放）；一个字没吐才退款。
@@ -890,13 +1184,72 @@ def api_chat():
                 db.save_chat_reply(
                     thread_id, request_id, reply_text, quota_left,
                     persona.price_incense, persona.persona_id,
+                    retrieved_chunk_ids=sorted(retrieved_chunk_ids),
+                )
+                _log_chat_usage_safe(
+                    fingerprint=fingerprint,
+                    hid=hid,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    persona=persona.persona_id,
+                    price=persona.price_incense,
+                    quota_left=quota_left,
+                    status='disconnect_saved',
+                    tool_calls=tool_calls,
+                    safety_triggered=safety_triggered,
+                    prompt_tokens=usage_tokens['prompt_tokens'],
+                    completion_tokens=usage_tokens['completion_tokens'],
+                    total_tokens=usage_tokens['total_tokens'],
+                    cost_usd=ai_service.calc_cost(
+                        usage_tokens['prompt_tokens'],
+                        usage_tokens['completion_tokens'],
+                    ) if usage_tokens['total_tokens'] else 0,
                 )
             else:
                 db.refund_chat_quota(hid, fingerprint, persona.price_incense)
+                _log_chat_usage_safe(
+                    fingerprint=fingerprint,
+                    hid=hid,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    persona=persona.persona_id,
+                    price=persona.price_incense,
+                    quota_left=db.get_chat_quota_left(hid, fingerprint),
+                    status='disconnect_refunded',
+                    tool_calls=tool_calls,
+                    safety_triggered=safety_triggered,
+                    prompt_tokens=usage_tokens['prompt_tokens'],
+                    completion_tokens=usage_tokens['completion_tokens'],
+                    total_tokens=usage_tokens['total_tokens'],
+                    cost_usd=ai_service.calc_cost(
+                        usage_tokens['prompt_tokens'],
+                        usage_tokens['completion_tokens'],
+                    ) if usage_tokens['total_tokens'] else 0,
+                )
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception('chat stream failed: thread=%s request=%s', thread_id, request_id)
             db.refund_chat_quota(hid, fingerprint, persona.price_incense)
+            _log_chat_usage_safe(
+                fingerprint=fingerprint,
+                hid=hid,
+                thread_id=thread_id,
+                request_id=request_id,
+                persona=persona.persona_id,
+                price=persona.price_incense,
+                quota_left=db.get_chat_quota_left(hid, fingerprint),
+                status='error',
+                tool_calls=tool_calls,
+                safety_triggered=safety_triggered,
+                prompt_tokens=usage_tokens['prompt_tokens'],
+                completion_tokens=usage_tokens['completion_tokens'],
+                total_tokens=usage_tokens['total_tokens'],
+                cost_usd=ai_service.calc_cost(
+                    usage_tokens['prompt_tokens'],
+                    usage_tokens['completion_tokens'],
+                ) if usage_tokens['total_tokens'] else 0,
+                error_type=type(exc).__name__,
+            )
             yield chat_graph_dump_sse({
                 'type': 'error',
                 'message': 'AI 服务暂时不可用，香火已退回，请稍后重试',
@@ -909,6 +1262,7 @@ def api_chat():
             'Cache-Control': 'no-cache',
             'X-Accel-Buffering': 'no',
             'X-Quota-Left': str(quota_left),
+            'X-Unlimited-Quota': str(quota_unlimited).lower(),
         },
     )
 
@@ -956,7 +1310,7 @@ def api_chat_personas():
 
 @app.route('/api/chat/quota', methods=['GET'])
 def api_chat_quota():
-    """查询某命盘的剩余追问次数。"""
+    """查询某命盘的剩余香火。"""
     fingerprint, _ = _chat_auth()
     if not fingerprint:
         return jsonify({'error': '请先登录', 'need_login': True}), 401
@@ -965,11 +1319,14 @@ def api_chat_quota():
         return jsonify({'error': '参数不完整', 'message': '缺少有效的命盘编号 hid'}), 400
     if not db.get_history_detail(hid, fingerprint):
         return jsonify({'error': '记录不存在'}), 404
-    return jsonify({
+    body = {
         'hid': hid,
         'quota_left': db.get_chat_quota_left(hid, fingerprint),
         'limit': db.CHAT_FREE_INCENSE,
-    })
+    }
+    if db.is_superuser_fingerprint(fingerprint):
+        body['unlimited'] = True
+    return jsonify(body)
 
 
 @app.route('/api/chat/history', methods=['GET'])
@@ -1010,11 +1367,47 @@ def api_chat_history():
         elif mtype == 'ai' and content and not getattr(msg, 'tool_calls', None):
             messages.append({'role': 'assistant', 'content': content})
 
-    return jsonify({
+    body = {
         'hid': hid,
         'messages': messages,
         'quota_left': db.get_chat_quota_left(hid, fingerprint),
-    })
+    }
+    if db.is_superuser_fingerprint(fingerprint):
+        body['unlimited'] = True
+    return jsonify(body)
+
+
+@app.route('/api/chat/feedback', methods=['POST'])
+def api_chat_feedback():
+    """P4 helpful 采集：只存 request 级评分元数据，不存正文。"""
+    fingerprint, _ = _chat_auth()
+    if not fingerprint:
+        return jsonify({'error': '请先登录', 'need_login': True}), 401
+
+    body = request.get_json(silent=True) or {}
+    try:
+        hid = int(body.get('hid', 0) or 0)
+    except (TypeError, ValueError):
+        hid = 0
+    request_id = str(body.get('request_id', '') or '').strip()
+    try:
+        rating = int(body.get('rating', 0) or 0)
+    except (TypeError, ValueError):
+        rating = 0
+
+    if not hid or hid <= 0:
+        return jsonify({'error': '参数不完整', 'message': '缺少有效的命盘编号 hid'}), 400
+    if not request_id or len(request_id) > CHAT_REQUEST_ID_MAX_LEN:
+        return jsonify({'error': '参数不完整', 'message': '缺少有效的 request_id'}), 400
+    if rating not in (-1, 1):
+        return jsonify({'error': '参数不合法', 'message': 'rating 只能是 1 或 -1'}), 400
+    if not db.get_history_detail(hid, fingerprint):
+        return jsonify({'error': '记录不存在', 'message': '命盘不存在或不属于当前账号'}), 404
+
+    saved = db.save_chat_feedback(fingerprint, hid, request_id, rating)
+    if not saved:
+        return jsonify({'error': '记录不存在', 'message': '这条追问回复尚未完成，不能评价'}), 404
+    return jsonify({'ok': True, 'rating': rating})
 
 
 def chat_graph_dump_sse(payload):
@@ -1033,7 +1426,7 @@ INDEX_HTML = r'''
     <meta name="theme-color" content="#0a0a0f">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>玄机阁 · 八字排盘</title>
+    <title>玄机阁 · 命盘咨询</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0a0f'/%3E%3Ccircle cx='32' cy='32' r='20' fill='none' stroke='%23d4af37' stroke-width='4'/%3E%3Cpath d='M32 12a20 20 0 0 1 0 40 10 10 0 0 0 0-20 10 10 0 0 1 0-20Z' fill='%23d4af37'/%3E%3Ccircle cx='32' cy='22' r='4' fill='%230a0a0f'/%3E%3Ccircle cx='32' cy='42' r='4' fill='%23d4af37'/%3E%3C/svg%3E">
     <script>
         (function() {
@@ -1274,6 +1667,107 @@ INDEX_HTML = r'''
             font-size: 0.7rem; color: var(--gold); white-space: nowrap; cursor: pointer;
         }
         .container { max-width: 900px; margin: 0 auto; padding: 0.75rem; padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px)); position: relative; z-index: 1; }
+        .agent-container {
+            max-width: 1180px;
+            padding: clamp(0.8rem, 2vw, 1.25rem);
+            padding-bottom: calc(clamp(1rem, 2vw, 1.5rem) + env(safe-area-inset-bottom, 0px));
+        }
+        .agent-hero {
+            display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1rem;
+            align-items: end; margin: 0.35rem 0 1rem; padding: clamp(1rem, 2vw, 1.35rem);
+            border: 1px solid var(--gold-border); border-radius: 18px;
+            background:
+                linear-gradient(135deg, var(--gold-tint-strong), transparent 52%),
+                linear-gradient(90deg, var(--bg-card), var(--bg-card-hover));
+            box-shadow: 0 20px 70px rgba(0,0,0,0.18);
+        }
+        .agent-kicker {
+            color: var(--gold); font-size: 0.72rem; letter-spacing: 0.18em;
+            text-transform: uppercase; margin-bottom: 0.35rem;
+        }
+        .agent-hero h1 {
+            color: var(--gold-bright); font-size: clamp(1.45rem, 3vw, 2.55rem);
+            line-height: 1.16; letter-spacing: 0.03em; margin: 0 0 0.55rem;
+        }
+        .agent-hero p {
+            color: var(--text); max-width: 58rem; line-height: 1.72; font-size: 0.92rem;
+        }
+        .agent-status-strip { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.45rem; }
+        .agent-status-pill {
+            min-height: 34px; display: inline-flex; align-items: center; gap: 0.35rem;
+            border: 1px solid var(--border); border-radius: 999px; padding: 0.25rem 0.65rem;
+            color: var(--text-dim); background: var(--bg-card); font-size: 0.75rem; white-space: nowrap;
+        }
+        .agent-status-pill strong { color: var(--gold-bright); font-weight: 700; }
+        .agent-shell {
+            display: grid; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+            gap: clamp(0.8rem, 1.7vw, 1.15rem); align-items: start;
+        }
+        .agent-sidebar { display: grid; gap: 1rem; align-self: start; position: sticky; top: 5.75rem; }
+        .agent-rail {
+            grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 1rem; align-self: start; position: static;
+        }
+        .agent-workbench { min-width: 0; display: grid; gap: 1rem; }
+        .agent-workbench > *, .result-section > * { min-width: 0; max-width: 100%; }
+        .agent-panel {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 14px; padding: 1rem;
+        }
+        .agent-panel-title {
+            color: var(--gold-bright); font-size: 0.92rem; margin-bottom: 0.6rem;
+            display: flex; justify-content: space-between; gap: 0.7rem; align-items: center;
+        }
+        .agent-panel-copy { color: var(--text-dim); font-size: 0.78rem; line-height: 1.65; }
+        .agent-empty-state {
+            min-height: 430px; display: grid; place-items: center; text-align: center;
+            border: 1px dashed var(--gold-border); border-radius: 18px;
+            background: linear-gradient(135deg, var(--bg-card), rgba(201,168,76,0.06));
+            padding: clamp(1.2rem, 4vw, 2rem);
+        }
+        .agent-empty-inner { max-width: 36rem; }
+        .agent-empty-kicker { color: var(--gold); font-size: 0.75rem; letter-spacing: 0.16em; margin-bottom: 0.45rem; }
+        .agent-empty-title { color: var(--gold-bright); font-size: clamp(1.3rem, 2.6vw, 2rem); margin-bottom: 0.65rem; }
+        .agent-empty-copy { color: var(--text); line-height: 1.75; font-size: 0.92rem; }
+        .agent-empty-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.6rem; margin-top: 1.2rem; text-align: left; }
+        .agent-empty-step {
+            border: 1px solid var(--border); border-radius: 12px; padding: 0.75rem;
+            background: var(--bg-card); min-width: 0;
+        }
+        .agent-step-num { color: var(--red-bright); font-size: 0.72rem; margin-bottom: 0.25rem; }
+        .agent-step-title { color: var(--gold-bright); font-size: 0.86rem; margin-bottom: 0.25rem; }
+        .agent-step-copy { color: var(--text-dim); font-size: 0.74rem; line-height: 1.55; }
+        .agent-result-head {
+            display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1rem; align-items: center;
+            margin-bottom: 1rem; padding: 1rem; border: 1px solid var(--gold-border);
+            border-radius: 16px; background: linear-gradient(135deg, var(--gold-tint), var(--bg-card));
+        }
+        .agent-result-title { color: var(--gold-bright); font-size: 1.08rem; margin-bottom: 0.32rem; }
+        .agent-result-copy { color: var(--text-dim); font-size: 0.78rem; line-height: 1.6; }
+        .agent-result-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }
+        .agent-mini-badge {
+            border: 1px solid var(--border); border-radius: 999px; padding: 0.22rem 0.55rem;
+            color: var(--text-dim); background: var(--bg-card-hover); font-size: 0.72rem; white-space: nowrap;
+        }
+        .agent-rail-card {
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+            padding: 0.95rem; overflow: hidden;
+        }
+        .agent-rail-title { color: var(--gold-bright); font-size: 0.88rem; margin-bottom: 0.65rem; }
+        .agent-rail-list { display: grid; gap: 0.55rem; }
+        .agent-rail-item {
+            display: grid; grid-template-columns: 8px minmax(0, 1fr); gap: 0.55rem; align-items: start;
+            color: var(--text-dim); font-size: 0.76rem; line-height: 1.55;
+        }
+        .agent-rail-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--gold); margin-top: 0.4rem; box-shadow: 0 0 0 3px var(--gold-tint); }
+        .agent-rail-item strong { color: var(--text); font-weight: 700; }
+        .agent-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; }
+        .agent-metric {
+            border: 1px solid var(--border); border-radius: 10px; padding: 0.62rem;
+            background: var(--bg-card-hover);
+        }
+        .agent-metric-value { color: var(--gold-bright); font-size: 1rem; font-variant-numeric: tabular-nums; }
+        .agent-metric-label { color: var(--text-dim); font-size: 0.68rem; margin-top: 0.2rem; line-height: 1.45; }
 
         /* 输入卡片 */
         .input-card {
@@ -1565,6 +2059,16 @@ INDEX_HTML = r'''
             align-self: flex-start; background: var(--bg-card-hover); color: var(--text);
             border: 1px solid var(--border); border-bottom-left-radius: 4px;
         }
+        .chat-feedback { display: flex; gap: 0.35rem; margin-top: 0.45rem; white-space: normal; }
+        .chat-feedback-btn {
+            border: 1px solid var(--border); border-radius: 999px; background: transparent;
+            color: var(--text-dim); padding: 0.18rem 0.55rem; font-size: 0.72rem;
+            cursor: pointer; transition: all 0.18s ease;
+        }
+        .chat-feedback-btn:hover, .chat-feedback-btn.selected {
+            color: var(--gold-bright); border-color: var(--gold-border); background: var(--gold-tint);
+        }
+        .chat-feedback-btn:disabled { opacity: 0.65; cursor: default; }
         .chat-bubble.replay-note { align-self: center; background: transparent; color: var(--text-dim); font-size: 0.72rem; border: 0; padding: 0.1rem; }
         .chat-status { display: none; color: var(--gold); font-size: 0.78rem; margin-bottom: 0.6rem; }
         .chat-status.busy { display: block; animation: ai-pulse 1.6s ease-in-out infinite; }
@@ -1577,7 +2081,8 @@ INDEX_HTML = r'''
         }
         .chat-input:focus { outline: none; border-color: var(--gold-border); }
         .chat-send-btn {
-            min-height: 44px; padding: 0 1.05rem; font-size: 0.9rem; flex-shrink: 0;
+            width: auto; margin-top: 0; min-height: 44px; padding: 0 1.05rem;
+            font-size: 0.9rem; flex: 0 0 auto;
         }
         .chat-send-btn:disabled { opacity: 0.6; cursor: default; transform: none; }
         .chat-note { margin-top: 0.7rem; color: var(--text-dim); font-size: 0.74rem; line-height: 1.6; }
@@ -1751,6 +2256,10 @@ INDEX_HTML = r'''
         }
         .history-delete:hover { color: var(--red-bright); }
         .history-empty { text-align: center; color: var(--text-dim); padding: 1rem; font-size: 0.9rem; }
+        .agent-sidebar .input-card, .agent-sidebar .history-section { margin-bottom: 0; padding: 1rem; }
+        .agent-sidebar .history-item { align-items: flex-start; gap: 0.6rem; padding: 0.75rem; }
+        .agent-sidebar .history-item-info { flex-direction: column; align-items: flex-start; gap: 0.28rem; min-width: 0; }
+        .agent-sidebar .history-item-date { line-height: 1.45; }
 
         /* 演算动画遮罩 */
         .divine-overlay {
@@ -1825,6 +2334,8 @@ INDEX_HTML = r'''
         @media (min-width: 601px) {
             .container { padding: clamp(0.75rem, 3vw, 2rem); }
             .input-card { padding: clamp(1rem, 3vw, 2rem); margin-bottom: clamp(1rem, 2vw, 2rem); }
+            .agent-container { padding: clamp(0.9rem, 2vw, 1.25rem); }
+            .agent-sidebar .input-card, .agent-sidebar .history-section { padding: 1rem; margin-bottom: 0; }
             .ai-section { padding: clamp(1rem, 3vw, 2rem); }
             .header { padding: clamp(0.5rem, 2vw, 1rem) clamp(0.75rem, 3vw, 2rem); padding-top: clamp(0.5rem, 2vw, 1rem); }
             .logo { gap: clamp(0.5rem, 1vw, 0.8rem); }
@@ -1840,9 +2351,29 @@ INDEX_HTML = r'''
             .btn-divine { padding: clamp(0.8rem, 1vw, 1rem); font-size: clamp(1.05rem, 1vw, 1.1rem); margin-top: clamp(0.75rem, 1.5vw, 1.5rem); min-height: 50px; }
             .info-grid { grid-template-columns: repeat(2, 1fr); }
         }
+        @media (max-width: 1180px) {
+            .agent-shell { grid-template-columns: minmax(250px, 320px) minmax(0, 1fr); }
+            .agent-rail { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        }
+        @media (max-width: 900px) {
+            .agent-hero { grid-template-columns: 1fr; align-items: start; }
+            .agent-status-strip { justify-content: flex-start; }
+            .agent-shell { grid-template-columns: 1fr; }
+            .agent-sidebar { position: static; }
+            .agent-rail { grid-template-columns: 1fr; }
+            .agent-empty-steps { grid-template-columns: 1fr; }
+            .agent-result-head { grid-template-columns: 1fr; }
+            .agent-result-badges { justify-content: flex-start; }
+        }
 
         /* 移动端动画优化 */
         @media (max-width: 600px) {
+            .agent-container { padding: 0.75rem; }
+            .agent-hero { border-radius: 14px; margin-top: 0.2rem; }
+            .agent-hero h1 { font-size: 1.55rem; }
+            .agent-status-pill { width: calc(50% - 0.25rem); justify-content: center; }
+            .agent-empty-state { min-height: 360px; }
+            .agent-result-head { padding: 0.85rem; border-radius: 14px; }
             .header { gap: 0.5rem; }
             .header-actions { gap: 0.45rem; }
             .logo-text { letter-spacing: 0.1em; }
@@ -1937,7 +2468,7 @@ INDEX_HTML = r'''
             <div class="logo-taiji"></div>
             <div>
                 <div class="logo-text">玄机阁</div>
-                <div class="header-sub">八字排盘 · AI解读</div>
+                <div class="header-sub">命盘咨询 · 八字排盘</div>
             </div>
         </div>
         <div class="header-actions">
@@ -1949,7 +2480,23 @@ INDEX_HTML = r'''
         </div>
     </div>
 
-    <div class="container">
+    <div class="container agent-container">
+        <section class="agent-hero" aria-label="玄机阁命盘咨询">
+            <div>
+                <div class="agent-kicker">命盘咨询间</div>
+                <h1>先立命盘，再慢慢追问</h1>
+                <p>输入出生时间后，先排出你的四柱、大运与五行，再围绕事业、财运、情感或流年细问。需要典籍依据时，会优先查原文出处。</p>
+            </div>
+            <div class="agent-status-strip" aria-label="咨询特点">
+                <span class="agent-status-pill"><strong>可连续</strong> 追问</span>
+                <span class="agent-status-pill"><strong>典籍</strong> 可查</span>
+                <span class="agent-status-pill"><strong>命盘</strong> 回看</span>
+                <span class="agent-status-pill"><strong>边界</strong> 清楚</span>
+            </div>
+        </section>
+
+        <div class="agent-shell">
+            <aside class="agent-sidebar" aria-label="命盘与历史">
         <div class="input-card">
             <div class="card-title">输入生辰信息</div>
             <div class="form-grid">
@@ -1980,7 +2527,66 @@ INDEX_HTML = r'''
             <div class="history-list" id="historyList"></div>
         </div>
 
+            </aside>
+            <main class="agent-workbench" aria-label="命盘咨询区">
+                <section class="agent-empty-state" id="agentEmptyState">
+                    <div class="agent-empty-inner">
+                        <div class="agent-empty-kicker">先排出命盘</div>
+                        <div class="agent-empty-title">请道长从你的命盘说起</div>
+                        <div class="agent-empty-copy">先在左侧填入出生时间。排盘完成后，这里会打开追问入口、命盘要点和完整盘面，方便你从一个具体问题慢慢问下去。</div>
+                        <div class="agent-empty-steps" aria-label="咨询流程">
+                            <div class="agent-empty-step">
+                                <div class="agent-step-num">01</div>
+                                <div class="agent-step-title">建立命盘</div>
+                                <div class="agent-step-copy">四柱、大运、十神先由本地排盘完成。</div>
+                            </div>
+                            <div class="agent-empty-step">
+                                <div class="agent-step-num">02</div>
+                                <div class="agent-step-title">提出关心事</div>
+                                <div class="agent-step-copy">可以围绕流年、事业、情感或取舍继续问。</div>
+                            </div>
+                            <div class="agent-empty-step">
+                                <div class="agent-step-num">03</div>
+                                <div class="agent-step-title">留作回看</div>
+                                <div class="agent-step-copy">登录后可保存命盘和追问记录。</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
         <div class="result-section" id="resultSection">
+            <div class="agent-result-head">
+                <div>
+                    <div class="agent-result-title">当前命盘</div>
+                    <div class="agent-result-copy">下面先放追问入口，再列出盘面要点。你可以直接问最关心的一件事。</div>
+                </div>
+                <div class="agent-result-badges" aria-label="当前咨询能力">
+                    <span class="agent-mini-badge">可连续追问</span>
+                    <span class="agent-mini-badge">香火配额</span>
+                    <span class="agent-mini-badge">典籍参考</span>
+                </div>
+            </div>
+
+            <!-- chat 追问区：Agent 主体验，多轮上下文在服务端 -->
+            <div class="chat-section" id="chatSection">
+                <div class="chat-head">
+                    <div class="chat-title">继续追问</div>
+                    <div class="chat-quota" id="chatQuota"></div>
+                </div>
+                <!-- 道长选择条：卡片数据来自 /api/chat/personas?hid=，选中即改后续 persona -->
+                <div class="persona-bar" id="personaBar" role="group" aria-label="选择请教的道长"></div>
+                <div class="chat-messages" id="chatMessages" aria-live="polite"></div>
+                <div class="chat-status" id="chatStatus" role="status"></div>
+                <div class="chat-error" id="chatError" role="alert"></div>
+                <div class="chat-input-row">
+                    <textarea class="chat-input" id="chatInput" rows="1" maxlength="500"
+                              placeholder="直接追问：2027年财运具体哪个月要谨慎？"></textarea>
+                    <button class="btn-divine chat-send-btn" id="chatSendBtn" type="button"
+                            onclick="sendChat()">追问</button>
+                </div>
+                <div class="chat-note">每个命盘赠 10 炷香火，各道长每问耗香不同；回复会按需参考流年、大运、排盘与古籍，内容仅作传统文化与自我观察参考。</div>
+            </div>
+
             <div class="info-grid">
                 <div class="info-card"><div class="info-card-title">公历</div><div class="info-card-value" id="r_solar"></div></div>
                 <div class="info-card"><div class="info-card-title">农历</div><div class="info-card-value" id="r_lunar"></div></div>
@@ -2069,25 +2675,34 @@ INDEX_HTML = r'''
                 </div>
             </div>
 
-            <!-- chat 追问区：看盘追问，多轮上下文在服务端 -->
-            <div class="chat-section" id="chatSection">
-                <div class="chat-head">
-                    <div class="chat-title">继续追问道长</div>
-                    <div class="chat-quota" id="chatQuota"></div>
-                </div>
-                <!-- 道长选择条：卡片数据来自 /api/chat/personas?hid=，选中即改后续 persona -->
-                <div class="persona-bar" id="personaBar" role="group" aria-label="选择请教的道长"></div>
-                <div class="chat-messages" id="chatMessages" aria-live="polite"></div>
-                <div class="chat-status" id="chatStatus" role="status"></div>
-                <div class="chat-error" id="chatError" role="alert"></div>
-                <div class="chat-input-row">
-                    <textarea class="chat-input" id="chatInput" rows="1" maxlength="500"
-                              placeholder="针对此盘追问，如：2027年流年如何？"></textarea>
-                    <button class="btn-divine chat-send-btn" id="chatSendBtn" type="button"
-                            onclick="sendChat()">追问</button>
-                </div>
-                <div class="chat-note">每个命盘赠 10 炷香火，各道长每问耗香不同（见卡片标价）；追问按多轮上下文连续回答，回复仅作传统文化参考。</div>
-            </div>
+        </div>
+            </main>
+            <aside class="agent-rail" aria-label="咨询说明">
+                <section class="agent-rail-card">
+                    <div class="agent-rail-title">适合这样问</div>
+                    <div class="agent-rail-list">
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>流年节奏</strong><br>例如哪一年更宜守成，哪几个月要谨慎。</span></div>
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>事业取舍</strong><br>围绕换岗、合作、学习方向做传统命理参考。</span></div>
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>关系相处</strong><br>从性情、节奏和沟通方式看提醒。</span></div>
+                    </div>
+                </section>
+                <section class="agent-rail-card">
+                    <div class="agent-rail-title">如何给依据</div>
+                    <div class="agent-rail-list">
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>先看盘面</strong><br>日主、月令、大运和五行偏向是第一层依据。</span></div>
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>必要时查书</strong><br>涉及古籍原文时，会优先参考本地整理的典籍。</span></div>
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>不作绝对断语</strong><br>重要决定仍需结合现实条件判断。</span></div>
+                    </div>
+                </section>
+                <section class="agent-rail-card">
+                    <div class="agent-rail-title">使用边界</div>
+                    <div class="agent-rail-list">
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>传统文化参考</strong><br>不替代医疗、投资、法律或婚姻等重大决定。</span></div>
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>隐私优先</strong><br>删盘会同步清理相关追问记录。</span></div>
+                        <div class="agent-rail-item"><span class="agent-rail-dot"></span><span><strong>反馈很轻</strong><br>回复后只需点有用或没用，帮助改进体验。</span></div>
+                    </div>
+                </section>
+            </aside>
         </div>
     </div>
 
@@ -2169,9 +2784,7 @@ INDEX_HTML = r'''
         function setTheme(theme) {
             const nextTheme = theme === 'light' ? 'light' : 'dark';
             document.documentElement.dataset.theme = nextTheme;
-            try {
-                localStorage.setItem('xjg_theme', nextTheme);
-            } catch (e) {}
+            safeStorageSet('xjg_theme', nextTheme);
             updateThemeToggle(nextTheme);
         }
 
@@ -2183,12 +2796,31 @@ INDEX_HTML = r'''
             updateThemeToggle(getCurrentTheme());
         });
 
+        function safeStorageGet(key) {
+            try {
+                if (window.localStorage) return window.localStorage.getItem(key);
+            } catch (e) {}
+            return '';
+        }
+
+        function safeStorageSet(key, value) {
+            try {
+                if (window.localStorage) window.localStorage.setItem(key, value);
+            } catch (e) {}
+        }
+
+        function safeStorageRemove(key) {
+            try {
+                if (window.localStorage) window.localStorage.removeItem(key);
+            } catch (e) {}
+        }
+
         // === 客户端唯一ID（存 localStorage，跨会话稳定，不随IP变化） ===
         function getClientId() {
-            let cid = localStorage.getItem('xjg_client_id');
+            let cid = safeStorageGet('xjg_client_id');
             if (!cid) {
                 cid = 'c' + Date.now() + Math.random().toString(36).slice(2, 10);
-                localStorage.setItem('xjg_client_id', cid);
+                safeStorageSet('xjg_client_id', cid);
             }
             return cid;
         }
@@ -2201,7 +2833,7 @@ INDEX_HTML = r'''
                 'X-Client-Id': CLIENT_ID
             });
             // 带上登录token
-            const token = localStorage.getItem('xjg_auth_token');
+            const token = safeStorageGet('xjg_auth_token');
             if (token) {
                 opts.headers['Authorization'] = 'Bearer ' + token;
             }
@@ -2712,8 +3344,8 @@ INDEX_HTML = r'''
                     return;
                 }
                 // 成功
-                localStorage.setItem('xjg_auth_token', data.token);
-                localStorage.setItem('xjg_username', data.username);
+                safeStorageSet('xjg_auth_token', data.token);
+                safeStorageSet('xjg_username', data.username);
                 closeAuthModal();
                 updateQuota();
                 loadHistory();  // 换了账号身份，历史记录也要切换
@@ -2733,12 +3365,12 @@ INDEX_HTML = r'''
         }
 
         async function handleLogout() {
-            const token = localStorage.getItem('xjg_auth_token');
+            const token = safeStorageGet('xjg_auth_token');
             if (token) {
                 await fetch('/api/logout', {method: 'POST', headers: {'Authorization': 'Bearer ' + token}});
             }
-            localStorage.removeItem('xjg_auth_token');
-            localStorage.removeItem('xjg_username');
+            safeStorageRemove('xjg_auth_token');
+            safeStorageRemove('xjg_username');
             resetChat();  // chat 会话按账号隔离，登出即收起
             updateQuota();
             loadHistory();  // 退出后回到匿名身份的历史记录
@@ -2754,7 +3386,9 @@ INDEX_HTML = r'''
                 const badge = document.getElementById('quotaBadge');
                 const userBadge = document.getElementById('userBadge');
                 if (data.logged_in) {
-                    badge.textContent = `免费: ${data.free_remaining}/${data.free_total}`;
+                    badge.textContent = data.unlimited
+                        ? '超级账号 · 无限额度'
+                        : `免费: ${data.free_remaining}/${data.free_total}`;
                     userBadge.textContent = data.username + ' | 退出';
                     userBadge.onclick = handleLogout;
                     userBadge.style.display = 'block';
@@ -3005,10 +3639,12 @@ INDEX_HTML = r'''
         let chatHid = null;
         let chatStreaming = false;
         let chatRetryPayload = null;   // {message, request_id}：断线后重发同一 id 走幂等
+        let chatQuotaUnlimited = false;
         const CHAT_TOOL_HINTS = {
             query_liunian: '正在查阅流年干支...',
             query_dayun: '正在核对大运...',
             lookup_classics: '正在翻检典籍...',
+            search_classics: '正在翻检典籍...',
             query_paipan: '正在另起一盘参看...',
         };
 
@@ -3017,7 +3653,7 @@ INDEX_HTML = r'''
         // 道长选择条状态（persona-plan §6）：花名册缓存 + 当前选中 + 本地余额
         let chatPersonas = [];      // /api/chat/personas 返回（有序）
         let chatPersonaId = null;   // 当前选中；null = 尚未加载（发请求时不带 persona，服务端回落缺省）
-        let chatQuotaLeft = null;   // 本地缓存的香火余额（null = 未知，置灰逻辑跳过）
+        let chatQuotaLeft = null;   // 本地缓存的香火余额（null = 未知/无限，置灰逻辑跳过）
 
         function personaTitle(personaId) {
             const p = chatPersonas.find(x => x.persona_id === personaId);
@@ -3062,7 +3698,7 @@ INDEX_HTML = r'''
             const switching = chatPersonaId !== null
                 && chatEl('chatMessages').children.length > 0;
             chatPersonaId = personaId;
-            renderPersonaBar(chatQuotaLeft);
+            renderPersonaBar(chatQuotaUnlimited ? null : chatQuotaLeft);
             // 换人轻提示（persona-plan §4.2）：不弹窗不打断，一行小字
             if (switching) {
                 appendChatBubble('replay-note', '已改请教' + p.title + '，前情他已看过。');
@@ -3090,7 +3726,7 @@ INDEX_HTML = r'''
                 // 手工选中只在本次页面会话内生效，刷新后仍以服务端记录恢复
                 const current = data.find(x => x.current);
                 chatPersonaId = current ? current.persona_id : 'qingxu';
-                renderPersonaBar(chatQuotaLeft);
+                renderPersonaBar(chatQuotaUnlimited ? null : chatQuotaLeft);
             } catch (e) {}
         }
 
@@ -3102,6 +3738,52 @@ INDEX_HTML = r'''
             wrap.appendChild(el);
             wrap.scrollTop = wrap.scrollHeight;
             return el;
+        }
+
+        async function submitChatFeedback(hid, requestId, rating, controls) {
+            if (!hid || !requestId || !controls) return;
+            const buttons = Array.from(controls.querySelectorAll('button'));
+            buttons.forEach(btn => { btn.disabled = true; });
+            try {
+                const res = await apiFetch('/api/chat/feedback', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({hid: hid, request_id: requestId, rating: rating})
+                });
+                if (!res.ok) throw new Error('feedback failed');
+                controls.dataset.rating = String(rating);
+                buttons.forEach(btn => {
+                    btn.classList.toggle('selected', Number(btn.dataset.rating) === rating);
+                });
+            } catch (e) {
+                showChatError('反馈没有保存成功，请稍后再试。');
+            } finally {
+                buttons.forEach(btn => { btn.disabled = false; });
+            }
+        }
+
+        function attachChatFeedback(assistantEl, hid, requestId) {
+            if (!assistantEl || !requestId || assistantEl.querySelector('.chat-feedback')) return;
+            const controls = document.createElement('div');
+            controls.className = 'chat-feedback';
+            const helpful = document.createElement('button');
+            helpful.type = 'button';
+            helpful.className = 'chat-feedback-btn';
+            helpful.dataset.rating = '1';
+            helpful.textContent = '有用';
+            helpful.title = '标记这次追问有帮助';
+            const unhelpful = document.createElement('button');
+            unhelpful.type = 'button';
+            unhelpful.className = 'chat-feedback-btn';
+            unhelpful.dataset.rating = '-1';
+            unhelpful.textContent = '没用';
+            unhelpful.title = '标记这次追问帮助不大';
+            helpful.onclick = function() { submitChatFeedback(hid, requestId, 1, controls); };
+            unhelpful.onclick = function() { submitChatFeedback(hid, requestId, -1, controls); };
+            controls.appendChild(helpful);
+            controls.appendChild(unhelpful);
+            assistantEl.appendChild(controls);
+            chatEl('chatMessages').scrollTop = chatEl('chatMessages').scrollHeight;
         }
 
         function setChatStatus(text) {
@@ -3136,15 +3818,24 @@ INDEX_HTML = r'''
             btn.className = 'ai-share-btn';
             btn.style.marginLeft = '0.5rem';
             btn.textContent = '重发恢复';
-            // 同 request_id 重发：服务端已答过的部分直接回放，不重复扣次数
+            // 同 request_id 重发：服务端已答过的部分直接回放，不重复计香
             btn.onclick = function() { clearChatError(); sendChat(true); };
             el.appendChild(btn);
         }
 
-        function updateChatQuota(left) {
+        function updateChatQuota(left, unlimited) {
             const el = chatEl('chatQuota');
             const btn = chatEl('chatSendBtn');
             if (typeof left !== 'number') return;
+            chatQuotaUnlimited = !!unlimited;
+            if (chatQuotaUnlimited) {
+                chatQuotaLeft = null;
+                el.textContent = '香火无限';
+                btn.disabled = chatStreaming;
+                btn.textContent = '追问';
+                renderPersonaBar(null);
+                return;
+            }
             chatQuotaLeft = left;
             // 香火制文案（persona-plan §6）：函数名保留，单位换炷
             el.textContent = left > 0 ? ('香火 ' + left + ' 炷') : '香火已尽';
@@ -3168,6 +3859,7 @@ INDEX_HTML = r'''
             chatPersonas = [];
             chatPersonaId = null;
             chatQuotaLeft = null;
+            chatQuotaUnlimited = false;
             chatEl('chatMessages').innerHTML = '';
             chatEl('personaBar').innerHTML = '';
             chatEl('chatSection').style.display = 'none';
@@ -3182,6 +3874,7 @@ INDEX_HTML = r'''
             chatRetryPayload = null;
             chatPersonaId = null;   // 切盘后由花名册 current 重新定选中
             chatQuotaLeft = null;
+            chatQuotaUnlimited = false;
             chatEl('chatMessages').innerHTML = '';
             chatEl('chatSection').style.display = 'block';
             loadChatHistory();
@@ -3199,7 +3892,7 @@ INDEX_HTML = r'''
                     return;
                 }
                 const data = await res.json();
-                updateChatQuota(data.quota_left);
+                updateChatQuota(data.quota_left, !!data.unlimited);
             } catch (e) {}
         }
 
@@ -3218,7 +3911,7 @@ INDEX_HTML = r'''
                         m.role === 'user' ? 'user' : 'assistant', m.content
                     ));
                 }
-                updateChatQuota(data.quota_left);
+                updateChatQuota(data.quota_left, !!data.unlimited);
             } catch (e) {}
         }
 
@@ -3230,6 +3923,7 @@ INDEX_HTML = r'''
         async function sendChat(isRetry) {
             if (chatStreaming || chatHid === null) return;
             const input = chatEl('chatInput');
+            const activeHid = chatHid;
             const text = isRetry && chatRetryPayload ? chatRetryPayload.message : input.value.trim();
             if (!text) return;
             const requestId = isRetry && chatRetryPayload
@@ -3253,7 +3947,7 @@ INDEX_HTML = r'''
                     headers: {'Content-Type': 'application/json'},
                     // persona 为空串时服务端回落缺省道长（未加载完花名册的兜底）
                     body: JSON.stringify({
-                        hid: chatHid, message: text, request_id: requestId,
+                        hid: activeHid, message: text, request_id: requestId,
                         persona: chatPersonaId || ''
                     })
                 });
@@ -3317,19 +4011,32 @@ INDEX_HTML = r'''
                         } else if (chunk.type === 'done') {
                             gotDone = true;
                             setChatStatus('');
-                            if (chunk.quota_left !== undefined) updateChatQuota(chunk.quota_left);
-                            if (chunk.cached) {
-                                appendChatBubble('replay-note', '已展开此前未收完的回复，不重复计香。');
-                            } else if (chunk.persona && chunk.price) {
-                                // 计香行（persona-plan §6）：谁答的、上了几炷香
-                                const t = personaTitle(chunk.persona);
-                                appendChatBubble('replay-note', t
-                                    ? ('请教' + t + '，上香 ' + chunk.price + ' 炷。')
-                                    : ('上香 ' + chunk.price + ' 炷。'));
+                            if (chunk.quota_left !== undefined) updateChatQuota(chunk.quota_left, !!chunk.unlimited);
+                            const hasAssistantText = assistantEl.textContent.trim().length > 0;
+                            if (!hasAssistantText) {
+                                gotError = true;
+                                assistantEl.textContent = '刚才没有收到有效回复，请重新追问。';
+                            } else {
+                                attachChatFeedback(assistantEl, activeHid, chunk.request_id || requestId);
+                                if (chunk.cached) {
+                                    appendChatBubble('replay-note', '已展开此前未收完的回复，不重复计香。');
+                                } else if (chunk.unlimited && chunk.persona) {
+                                    const t = personaTitle(chunk.persona);
+                                    appendChatBubble('replay-note', t
+                                        ? ('超级账号测试中，请教' + t + '不计香火。')
+                                        : '超级账号测试中，本次不计香火。');
+                                } else if (chunk.persona && chunk.price) {
+                                    // 计香行（persona-plan §6）：谁答的、上了几炷香
+                                    const t = personaTitle(chunk.persona);
+                                    appendChatBubble('replay-note', t
+                                        ? ('请教' + t + '，上香 ' + chunk.price + ' 炷。')
+                                        : ('上香 ' + chunk.price + ' 炷。'));
+                                }
                             }
                         } else if (chunk.type === 'error') {
                             gotError = true;
                             setChatStatus('');
+                            if (chunk.quota_left !== undefined) updateChatQuota(chunk.quota_left, !!chunk.unlimited);
                             assistantEl.textContent = chunk.message || '回复失败，请稍后重试。';
                         }
                     }
@@ -3837,6 +4544,8 @@ INDEX_HTML = r'''
         function displayResult(r) {
             currentResultData = r;
             document.getElementById('resultSection').classList.add('active');
+            const emptyState = document.getElementById('agentEmptyState');
+            if (emptyState) emptyState.style.display = 'none';
             clearAIWaitTimer();
             aiUserSelectedTab = false;
             setAIQualityNote('', '');
@@ -3916,6 +4625,55 @@ INDEX_HTML = r'''
 </body>
 </html>
 '''
+
+_chat_cleanup_thread_started = False
+
+
+def run_chat_cleanup_once():
+    """Run one P3 stale chat cleanup pass."""
+    from chat_cleanup import cleanup_stale_chat_threads
+
+    return cleanup_stale_chat_threads(
+        retention_days=CHAT_CLEANUP_RETENTION_DAYS,
+        limit=1000,
+        dry_run=False,
+    )
+
+
+def _chat_cleanup_loop():
+    if CHAT_CLEANUP_INITIAL_DELAY_SECONDS > 0:
+        _time.sleep(CHAT_CLEANUP_INITIAL_DELAY_SECONDS)
+    while True:
+        try:
+            summary = run_chat_cleanup_once()
+            if summary['threads_found'] or summary['checkpoint_errors'] or summary['metadata_errors']:
+                logger.info('chat_cleanup summary=%s', summary)
+        except Exception:  # noqa: BLE001 background cleanup must not kill worker
+            logger.exception('chat_cleanup failed')
+        _time.sleep(max(60, CHAT_CLEANUP_INTERVAL_SECONDS))
+
+
+def start_chat_cleanup_thread():
+    """Start the optional in-process cleanup loop once per worker process."""
+    global _chat_cleanup_thread_started
+    if not CHAT_CLEANUP_ENABLED or _chat_cleanup_thread_started:
+        return False
+    thread = threading.Thread(
+        target=_chat_cleanup_loop,
+        name='xuanjige-chat-cleanup',
+        daemon=True,
+    )
+    thread.start()
+    _chat_cleanup_thread_started = True
+    logger.info(
+        'chat_cleanup enabled retention_days=%s interval_seconds=%s',
+        CHAT_CLEANUP_RETENTION_DAYS,
+        CHAT_CLEANUP_INTERVAL_SECONDS,
+    )
+    return True
+
+
+start_chat_cleanup_thread()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8888))

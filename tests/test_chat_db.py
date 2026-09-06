@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -98,6 +99,33 @@ class ChatQuotaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             db.refund_chat_quota(101, 'acct:1', 0)
 
+    def test_superuser_chat_quota_never_decrements(self):
+        token, error = db.register('root', 'pass1234')
+        self.assertIsNone(error)
+        self.assertTrue(db.set_account_superuser('root'))
+        fingerprint = db.get_account_fingerprint(token)
+
+        self.assertEqual((True, 5, True), db.check_quota_account(token))
+        db.consume_quota_account(token, True)
+        account = db.get_account_by_token(token)
+        self.assertEqual(0, account['free_trials_used'])
+        self.assertTrue(db.is_superuser_account(account))
+
+        ok, used = db.consume_chat_quota(101, fingerprint, 5)
+        self.assertTrue(ok)
+        self.assertEqual(0, used)
+        self.assertEqual(
+            db.SUPERUSER_CHAT_QUOTA_LEFT,
+            db.get_chat_quota_left(101, fingerprint),
+        )
+
+        conn = db.get_db()
+        row = conn.execute(
+            'SELECT used FROM chat_followups WHERE hid = ? AND fingerprint = ?',
+            (101, fingerprint),
+        ).fetchone()
+        conn.close()
+        self.assertIsNone(row)
     def test_quota_isolated_per_hid_and_account(self):
         db.consume_chat_quota(101, 'acct:1', 2)
         db.consume_chat_quota(101, 'acct:1', 3)
@@ -201,8 +229,42 @@ class ChatIncenseMigrationTests(unittest.TestCase):
         conn.close()
         self.assertIn('price', cols)
         self.assertIn('persona', cols)
+        self.assertIn('retrieved_chunk_ids_json', cols)
         # 新库无存量行：used*2 是空操作，quota_left 全量保持 10
         self.assertEqual(db.CHAT_FREE_INCENSE, db.get_chat_quota_left(1, 'acct:x'))
+
+    def test_existing_chat_usage_logs_gain_token_columns(self):
+        conn = sqlite3.connect(db.DB_PATH)
+        conn.executescript('''
+            CREATE TABLE chat_usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL,
+                hid INTEGER NOT NULL,
+                thread_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                persona TEXT NOT NULL DEFAULT '',
+                price INTEGER DEFAULT 0,
+                quota_left INTEGER DEFAULT 0,
+                cached INTEGER DEFAULT 0,
+                status TEXT NOT NULL,
+                tool_calls INTEGER DEFAULT 0,
+                safety_triggered INTEGER DEFAULT 0,
+                error_type TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+        ''')
+        conn.commit()
+        conn.close()
+
+        db.init_db()
+
+        conn = sqlite3.connect(db.DB_PATH)
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(chat_usage_logs)')}
+        conn.close()
+        self.assertIn('prompt_tokens', cols)
+        self.assertIn('completion_tokens', cols)
+        self.assertIn('total_tokens', cols)
+        self.assertIn('cost_usd', cols)
 
     def test_migrated_rows_are_readable_by_new_api(self):
         self._create_old_schema()
@@ -212,6 +274,8 @@ class ChatIncenseMigrationTests(unittest.TestCase):
         self.assertEqual(4, saved['quota_left'])
         self.assertEqual(2, saved['price'])
         self.assertEqual('qingxu', saved['persona'])
+        self.assertEqual([], saved['retrieved_chunk_ids'])
+        self.assertEqual('[]', saved['retrieved_chunk_ids_json'])
 
 
 class ChatRequestTests(unittest.TestCase):
@@ -232,12 +296,47 @@ class ChatRequestTests(unittest.TestCase):
 
     def test_reply_roundtrip_and_replay(self):
         thread = db.build_chat_thread_id('acct:1', 42)
-        db.save_chat_reply(thread, 'req-uuid-1', '丁未年宜守不宜攻', 3, 2, 'tiekou')
+        db.save_chat_reply(
+            thread,
+            'req-uuid-1',
+            '丁未年宜守不宜攻，参看【ditiansui-chanwei-ch029】。',
+            3,
+            2,
+            'tiekou',
+            retrieved_chunk_ids=[
+                'SANMINGTONGHUI-CH002',
+                'ditiansui-chanwei-ch029',
+                'ditiansui-chanwei-ch029',
+                '带中文的非法值',
+            ],
+        )
         saved = db.get_chat_reply(thread, 'req-uuid-1')
-        self.assertEqual(saved['reply_text'], '丁未年宜守不宜攻')
+        self.assertEqual(saved['reply_text'], '丁未年宜守不宜攻，参看【ditiansui-chanwei-ch029】。')
         self.assertEqual(saved['quota_left'], 3)
         self.assertEqual(saved['price'], 2)
         self.assertEqual(saved['persona'], 'tiekou')
+        self.assertEqual(
+            ['ditiansui-chanwei-ch029', 'sanmingtonghui-ch002'],
+            saved['retrieved_chunk_ids'],
+        )
+        self.assertEqual(saved['retrieved_chunk_ids'], json.loads(saved['retrieved_chunk_ids_json']))
+
+    def test_audit_candidates_include_retrieved_chunk_ids(self):
+        thread = db.build_chat_thread_id('acct:1', 42)
+        db.save_chat_reply(
+            thread,
+            'req-uuid-1',
+            '寒暖一节见【ditiansui-chanwei-ch029】。',
+            3,
+            2,
+            'qingxu',
+            retrieved_chunk_ids=['ditiansui-chanwei-ch029'],
+        )
+
+        candidates = db.list_chat_audit_candidates(sample_rate=1.0, limit=10, min_count=0)
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual(['ditiansui-chanwei-ch029'], candidates[0]['retrieved_chunk_ids'])
 
     def test_reply_is_write_once_never_overwritten(self):
         # 审查修正后的语义：首次写入后重发不覆盖（回放永远拿首次回复与首次账目）
@@ -273,6 +372,48 @@ class ChatRequestTests(unittest.TestCase):
         db.save_chat_reply('acct:1:42', 'req-1', '回复', 4, 2, 'tiekou')
         self.assertIsNone(db.get_last_chat_persona('acct:1:43'))
 
+    def test_chat_usage_log_roundtrip_without_sensitive_columns(self):
+        thread = db.build_chat_thread_id('acct:1', 42)
+        db.log_chat_usage(
+            fingerprint='acct:1',
+            hid=42,
+            thread_id=thread,
+            request_id='req-1',
+            persona='tiekou',
+            price=2,
+            quota_left=8,
+            cached=False,
+            status='ok',
+            tool_calls=1,
+            safety_triggered=False,
+            prompt_tokens=12,
+            completion_tokens=34,
+            total_tokens=46,
+            cost_usd=0.000135,
+        )
+
+        log = db.get_chat_usage_logs(thread)[0]
+        self.assertEqual('acct:1', log['fingerprint'])
+        self.assertEqual(42, log['hid'])
+        self.assertEqual('req-1', log['request_id'])
+        self.assertEqual('tiekou', log['persona'])
+        self.assertEqual(2, log['price'])
+        self.assertEqual(8, log['quota_left'])
+        self.assertEqual(0, log['cached'])
+        self.assertEqual('ok', log['status'])
+        self.assertEqual(1, log['tool_calls'])
+        self.assertEqual(0, log['safety_triggered'])
+        self.assertEqual(12, log['prompt_tokens'])
+        self.assertEqual(34, log['completion_tokens'])
+        self.assertEqual(46, log['total_tokens'])
+        self.assertAlmostEqual(0.000135, log['cost_usd'])
+
+        conn = sqlite3.connect(db.DB_PATH)
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(chat_usage_logs)')}
+        conn.close()
+        for forbidden in ('message', 'reply_text', 'paipan_json', 'birth_info', 'solar_date'):
+            self.assertNotIn(forbidden, cols)
+
     def test_last_chat_persona_cleared_by_delete_cascade(self):
         thread = db.build_chat_thread_id('acct:1', 42)
         db.save_chat_reply(thread, 'req-1', '回复', 4, 2, 'tiekou')
@@ -286,21 +427,27 @@ class ChatRequestTests(unittest.TestCase):
         db.consume_chat_quota(hid, fp, 2)
         db.save_chat_reply(thread, 'req-1', '回复1', 4, 2, 'qingxu')
         db.save_chat_reply(thread, 'req-2', '回复2', 3, 2, 'tiekou')
+        db.log_chat_usage(fp, hid, thread, 'req-1', 'qingxu', 2, 8, status='ok')
         # 别的盘/账号的数据不应被误删
         db.consume_chat_quota(43, fp, 1)
         db.save_chat_reply(db.build_chat_thread_id(fp, 43), 'req-x', '别盘回复', 4, 1, 'xuanzhen')
+        db.log_chat_usage(fp, 43, db.build_chat_thread_id(fp, 43), 'req-x', 'xuanzhen', 1, 9, status='ok')
         db.save_chat_reply(db.build_chat_thread_id('acct:2', hid), 'req-y', '别账号回复', 4, 5, 'zhangmen')
+        db.log_chat_usage('acct:2', hid, db.build_chat_thread_id('acct:2', hid), 'req-y', 'zhangmen', 5, 5, status='ok')
 
         deleted = db.delete_chat_cascade(fp, hid)
 
-        self.assertEqual(deleted, 3)  # 1 配额行 + 2 幂等行
+        self.assertEqual(deleted, 4)  # 1 配额行 + 2 幂等行 + 1 观测日志
         self.assertEqual(db.get_chat_quota_left(hid, fp), db.CHAT_FREE_INCENSE)
         self.assertIsNone(db.get_chat_reply(thread, 'req-1'))
         self.assertIsNone(db.get_chat_reply(thread, 'req-2'))
+        self.assertEqual([], db.get_chat_usage_logs(thread))
         # 邻近数据保留
         self.assertEqual(db.get_chat_quota_left(43, fp), db.CHAT_FREE_INCENSE - 1)
         self.assertIsNotNone(db.get_chat_reply(db.build_chat_thread_id(fp, 43), 'req-x'))
         self.assertIsNotNone(db.get_chat_reply(db.build_chat_thread_id('acct:2', hid), 'req-y'))
+        self.assertEqual(1, len(db.get_chat_usage_logs(db.build_chat_thread_id(fp, 43))))
+        self.assertEqual(1, len(db.get_chat_usage_logs(db.build_chat_thread_id('acct:2', hid))))
 
     def test_delete_cascade_is_idempotent(self):
         self.assertEqual(db.delete_chat_cascade('acct:9', 999), 0)

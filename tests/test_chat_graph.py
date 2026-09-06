@@ -211,6 +211,24 @@ class ParseStreamEventTests(unittest.TestCase):
     def test_empty_content_skipped(self):
         self.assertIsNone(parse_stream_event((AIMessageChunk(content=''), {})))
 
+    def test_content_block_text_event(self):
+        chunk = AIMessageChunk(content=[
+            {'type': 'reasoning', 'text': '不应外发'},
+            {'type': 'text', 'text': '丁未年'},
+            {'type': 'output_text', 'text': '，宜守成。'},
+        ])
+        self.assertEqual(
+            {'type': 'token', 'text': '丁未年，宜守成。'},
+            parse_stream_event((chunk, {})),
+        )
+
+    def test_reasoning_content_not_forwarded(self):
+        chunk = AIMessageChunk(
+            content='',
+            additional_kwargs={'reasoning_content': '这段是模型思考，不给用户看'},
+        )
+        self.assertIsNone(parse_stream_event((chunk, {})))
+
     def test_non_tuple_event_tolerated(self):
         self.assertIsNone(parse_stream_event(AIMessageChunk(content='x')))
 
@@ -227,6 +245,51 @@ class ParseStreamEventTests(unittest.TestCase):
     def test_human_message_echo_not_forwarded(self):
         ev = (HumanMessage('2027年我的流年如何？'), {})
         self.assertIsNone(parse_stream_event(ev))
+
+
+class ClassicsGroundingTests(unittest.TestCase):
+    def test_extract_retrieved_chunk_ids_from_search_tool_message(self):
+        ev = (ToolMessage(
+            content='1. chunk_id=ditiansui-chanwei-ch029；可引用格式=【ditiansui-chanwei-ch029】',
+            name='search_classics',
+            tool_call_id='call_search',
+        ), {})
+
+        self.assertEqual(
+            ['ditiansui-chanwei-ch029'],
+            chat_graph.extract_retrieved_chunk_ids(ev),
+        )
+
+    def test_non_search_tool_message_does_not_count_as_retrieval(self):
+        ev = (ToolMessage(
+            content='chunk_id=ditiansui-chanwei-ch029',
+            name='query_liunian',
+            tool_call_id='call_year',
+        ), {})
+
+        self.assertEqual([], chat_graph.extract_retrieved_chunk_ids(ev))
+
+    def test_grounded_citations_accept_only_retrieved_ids(self):
+        result = chat_graph.validate_grounded_citations(
+            '寒暖一节见【ditiansui-chanwei-ch029】，但另引【fake-book-ch001】。',
+            ['ditiansui-chanwei-ch029'],
+        )
+
+        self.assertFalse(result['ok'])
+        self.assertEqual(['fake-book-ch001'], result['missing_chunk_ids'])
+        self.assertEqual(
+            ['ditiansui-chanwei-ch029', 'fake-book-ch001'],
+            result['cited_chunk_ids'],
+        )
+
+    def test_grounded_citations_pass_when_no_fake_ids(self):
+        result = chat_graph.validate_grounded_citations(
+            '寒暖一节见【ditiansui-chanwei-ch029】。',
+            ['ditiansui-chanwei-ch029'],
+        )
+
+        self.assertTrue(result['ok'])
+        self.assertEqual([], result['missing_chunk_ids'])
 
 
 class ModelConfigTests(unittest.TestCase):
@@ -252,6 +315,8 @@ class PersonaModelTierTests(unittest.TestCase):
         self.assertEqual(chat_graph._resolve_model_name(), kwargs['model'])
         self.assertEqual(chat_graph.CHAT_MAX_TOKENS, kwargs['max_tokens'])
         self.assertEqual(chat_graph.CHAT_TEMPERATURE, kwargs['temperature'])
+        self.assertEqual({'thinking': {'type': 'disabled'}}, kwargs['extra_body'])
+        self.assertTrue(kwargs['stream_usage'])
 
     def test_zhangmen_tier_uses_pro_model(self):
         from chat_personas import get_persona
@@ -260,6 +325,7 @@ class PersonaModelTierTests(unittest.TestCase):
         self.assertEqual('deepseek-v4-pro', kwargs['model'])
         self.assertEqual(2000, kwargs['max_tokens'])
         self.assertEqual(0.6, kwargs['temperature'])
+        self.assertEqual({'thinking': {'type': 'disabled'}}, kwargs['extra_body'])
 
     def test_blank_model_falls_back_to_env_model(self):
         """flash 档人格 model 为空串：回落 CHAT_MODEL 环境档（不硬编码模型名）。"""
@@ -269,6 +335,7 @@ class PersonaModelTierTests(unittest.TestCase):
         self.assertEqual(chat_graph._resolve_model_name(), kwargs['model'])
         self.assertEqual(800, kwargs['max_tokens'])
         self.assertEqual(0.8, kwargs['temperature'])
+        self.assertEqual({'thinking': {'type': 'disabled'}}, kwargs['extra_body'])
 
     def test_each_persona_carries_distinct_tier(self):
         from chat_personas import PERSONAS

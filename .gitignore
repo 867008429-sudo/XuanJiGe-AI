@@ -17,7 +17,9 @@ venv/
 
 # 测试与临时产物
 .screenshots/
+.smoke/
 .uploads/
+artifacts/
 *.log
 
 # 私人项目接管笔记（仅本地保留）
@@ -25,3 +27,6 @@ docs/PROJECT_GUIDE.md
 
 # 本地规划文件
 .planning/
+
+# 外部参考仓库（不入库）
+.external/

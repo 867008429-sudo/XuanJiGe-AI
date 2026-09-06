@@ -14,6 +14,15 @@
 > 2. 新增第 14 节"外部参考项目与许可边界"：语料来源、react-agent 模板、FOR-BAZI 等参考项目的取舍与差异化定位
 > 3. 版权红线：语料只收公版原文，白话译文（网站制作、有版权）一律剥离
 > 4. 总排期 8 周缩为 7 周；面试防守清单扩到 19 题
+>
+> 2026-09-06 执行状态：
+> 1. P3 生产化已补齐到离线抽审 v1、chat 观测日志、自动清理、流中安全兜底与 token 机会性入账
+> 2. R1 语料工程已落地：7 本古籍原文清洗为 1025 chunks / 1,185,549 字，生成 `data/classics/` 与 `LICENSES.md`
+> 3. R2 检索基线已落地：`classics_search.py` 本地 BM25 + 字元 n-gram，20 组固定问题 top-5 命中率 100%
+> 4. R3 baseline 已接入：chat 工具切到 `search_classics`，流中拦截未检索过的 `chunk_id` 引用
+> 5. R4 baseline 已补齐：`chat_requests` 记录本轮检索到的 `chunk_id` 白名单，离线抽审可量化未验证引用
+> 6. P4 已启动：chat helpful 一键反馈、后台汇总与删盘/retention 清理链路已接入
+> 7. P4-UI 已按用户侧体验修订：首页从 Agent Console 改为命盘咨询间，左侧建盘/历史、中间继续追问，工程可信度机制只在用户可理解的“典籍参考/使用边界”里表达
 
 ---
 
@@ -35,16 +44,16 @@ v4 的叙事定位是**三段式范式对照**：
 
 当前仓库事实：注册被一次性体验码闸住；每账号 5 次免费解读；无付费通道；`accounts.credits` 闲置。
 
-### 2.1 追问配额（v4 定案：gate 时扣 + 失败退款）
+### 2.1 追问香火配额（v4 定案：gate 时扣 + 失败退款，P2 已按 persona-plan 升级）
 
 v3 的"原子扣减"和"失败不扣"在实现上互斥（gate 扣则失败需退款，成功后扣则有并发竞态），v4 定案如下：
 
 | 规则 | 内容 |
 |------|------|
 | 入口 | 登录 + 持有该命盘（hid 归属校验，见 4.5） |
-| 免费追问 | 每个命盘（hid）5 条，新表 `chat_followups` |
-| 扣减时机 | **gate 时原子扣减**：`UPDATE chat_followups SET used = used + 1 WHERE hid=? AND account=? AND used < 5`，受影响行数为 0 即额度不足，一步完成防双花 |
-| 失败退款 | AI 调用抛错（网络/超时/流中断）→ `used = used - 1` 回滚，退款逻辑只有一处调用点（`/api/chat` 的 finally 分支），SQLite 单写者序列化使扣与退都便宜 |
+| 免费追问 | 每个命盘（hid）10 炷香火，`chat_followups.used` 记录已消耗炷数 |
+| 扣减时机 | **gate 时原子扣减**：`UPDATE chat_followups SET used = used + ? WHERE hid=? AND account=? AND used + ? <= 10`，`?` 为所选道长定价，受影响行数为 0 即额度不足，一步完成防双花 |
+| 失败退款 | AI 调用抛错（网络/超时/流中断）→ `used = used - ?` 回滚，退款逻辑只有一处调用点（`/api/chat` 的 finally 分支），SQLite 单写者序列化使扣与退都便宜 |
 | 超出 | 不兜售任何东西，收尾话术引导回看已生成的报告 |
 | 退款失败兜底 | 退库 UPDATE 失败时记 `usage_logs` 人工核对（预期频率：接近零） |
 
@@ -80,7 +89,7 @@ v3 的"原子扣减"和"失败不扣"在实现上互斥（gate 扣则失败需�
 |---------|-----------------|
 | `bazi_engine.py` | 3 个引擎工具的底层 |
 | `ai_context.build_bazi_context` | `paipan_digest` 直接复用（name 过清洗后进） |
-| `bazi_knowledge.build_knowledge_packet` | P1 阶段 `lookup_classics` 字典版；RAG 上线后报告链路继续用 |
+| `bazi_knowledge.build_knowledge_packet` | 报告链路继续用的规则知识包；chat 古籍查询已切到 RAG baseline |
 | `ai_prompts.build_generation_contract` | chat system prompt 硬约束直接注入 |
 | `ai_validator.RISKY_PHRASES` | 流中兜底 + 收尾稽核（黑名单定位从"防线"降为"稽核信号"） |
 | `ai_validator` 伪造古籍拦截 | RAG 上线后升级为 chunk ID 回验（见第 6 节） |
@@ -98,7 +107,7 @@ class ChatState(TypedDict):
     messages: Annotated[list, add_messages]   # reducer 累加
     birth_info: dict            # 生辰+性别（gate 注入）
     paipan_digest: str          # 命盘摘要（name 清洗后）
-    chat_quota_left: int        # 剩余追问数
+    chat_quota_left: int        # 剩余香火炷数
     retrieved_chunks: list      # 本轮检索命中的 chunk（grounding 校验用）
 ```
 
@@ -108,7 +117,7 @@ class ChatState(TypedDict):
 |------|------|-------------|
 | `query_liunian(year)` | `get_exact_year_month_gz()` + `get_shishen()` | "2027 年我流年如何" |
 | `query_dayun(start_age)` | `calc_dayun()` 结果切片 | "我 35 岁那步大运细说" |
-| `lookup_classics(topic)` | **P1：`bazi_knowledge` 字典查表；R3：升级为 `search_classics(query, k)` 混合检索** | "《滴天髓》原文怎么说伤官格" |
+| `search_classics(query, k)` | **R3 baseline：`classics_search.py` 本地 BM25 + 字元 n-gram 检索，返回 `chunk_id`** | "《滴天髓》原文怎么说伤官格" |
 | `query_paipan(birth)` | `paipan()` | 追问他人的盘，返回后建议开新会话 |
 
 工具全部只读无副作用。失败时异常包装成 Observation 回传，agent 自行重试或换路；**工具失败不扣追问额度**（退款走 2.1 的 finally 分支）。
@@ -209,7 +218,7 @@ Agentic RAG 的全部"agentic"能力——自决是否检索、查询改写、�
 
 - **清洗管线**：剥离水印行/页码行/空行 → 识别章节边界（`第 N 章`）→ 按章分块 → 每块元数据（书名、章序、章节名）
 - **版权红线（不可妥协）**：原文是公版，**白话译文是网站制作、有版权——索引只收原文，译文一律剥离**。清洗脚本里做成显式步骤而非可选项。这条在面试里讲"我做了版权切分"是加分点
-- **分块粒度**：按章切（古籍天然分篇，不做机械定长切块），预计 3-5k chunks
+- **分块粒度**：按章切（古籍天然分篇，不做机械定长切块），2026-09-06 实测为 1025 chunks / 1,185,549 字；少于早期估算的 3-5k chunks，但每块保留篇章语义，适合先做检索基线
 - **校对红线**：出处错标比没有更糟，每书抽 5 篇核对篇目结构与通行本一致
 - **工作量**：清洗脚本半天 + 全量跑 + 抽样校对 1-2 天，合计 2-3 天（v4 估的 1-1.5 周作废——当时不知道语料现成）
 - **语料落地**：清洗产物进 `data/classics/`（每本一个 jsonl），来源仓库与许可在 `data/classics/LICENSES.md` 声明
@@ -220,24 +229,26 @@ Agentic RAG 的全部"agentic"能力——自决是否检索、查询改写、�
 - **不部署向量数据库**：几千 chunk 用进程内 `sqlite-vec` 或 numpy 矩阵余弦足够。"不为 5k chunk 上 Milvus"是刻意的克制决策，面试防守素材
 - **Embedding 选型**：首选本地 BGE-small-zh（零第三方依赖、与"不上 LangSmith"的隐私立场一致；语料向量化是一次性离线任务，查询单条 embedding CPU 毫秒级）。备选 DeepSeek embeddings 端点（$0.002/百万 token），用前先 curl 验证账户可用
 
+**2026-09-06 R2/R3 baseline**：先实现无外部依赖版本（`classics_search.py`）：BM25 + CJK bigram/trigram + 命理领域词加权，`tools/eval_classics_search.py` 固定 20 题 top-5 命中率 100%。chat 工具已切到 `search_classics`，并在流式输出中拦截未检索过的 `chunk_id`。向量余弦/RRF 暂不接入主线，留给 RAG 增强阶段，避免在约千级 chunks 上过早引入新部署依赖。
+
 ### 6.4 Grounded Citation（全方案最大亮点）
 
 现状：`ai_validator` 靠黑名单查"伪造古籍引用"，字面匹配，变体挡不住。RAG 化之后：
 
 - agent 引用古籍必须回扣所检索 chunk 的 ID（chunk_id 随工具结果返回，agent 引用时携带）
-- **可验证校验**：收尾时校验 agent 输出中出现的 chunk_id ⊆ 本轮 `retrieved_chunks`，不存在即判定为伪造引用
+- **可验证校验**：agent 输出中出现的 chunk_id 必须属于本轮 `search_classics` 工具返回；不存在即判定为伪造引用并触发安全兜底
 - 每条古籍引用有真实出处可回验——把现有校验器从"黑名单猜"升维为"attribution 验证"，这是现有资产的直接升维而非重写
 
 ### 6.5 轨道排期（不进关键路径）
 
 | 阶段 | 时长 | 交付物 | 验收 |
 |------|------|--------|------|
-| R1 语料工程 | **2-3 天（v4.1 压缩）** | 清洗脚本 + 3-5k chunks jsonl + LICENSES 声明 | 每书抽 5 篇核对篇目结构；**译文零残留抽查** |
-| R2 检索基建 | 3-4 天 | 混合检索模块 + 离线索引构建脚本 | 20 组"问题→应命中文献"检索命中率 ≥ 80% |
-| R3 工具切换 + grounding | 3-4 天 | `search_classics` 替换字典版 + chunk_id 回验 | 伪造引用注入测试被拦；检索评估集并入回归 |
-| R4 抽审扩展 | 1 天 | 离线判官增加"引用真实性"维度 | 抽审会话的引用错误率可量化 |
+| R1 语料工程 | **已完成（2026-09-06）** | 清洗脚本 + 1025 chunks jsonl + LICENSES 声明 | 译文/水印零残留自动扫描通过；每书抽样校对仍可继续加严 |
+| R2 检索基建 | **baseline 已完成（2026-09-06）** | 本地 BM25 检索模块 + 离线索引 smoke + 固定评估脚本 | 20 组"问题→应命中文献"top-5 命中率 100%，超过 ≥80% 门槛 |
+| R3 工具切换 + grounding | **baseline 已完成（2026-09-06）** | `search_classics` 替换字典版 + chunk_id 流中回验 | 跨 chunk 伪造引用测试被拦；检索评估集并入定向回归 |
+| R4 抽审扩展 | **baseline 已完成（2026-09-06）** | 离线判官增加"引用真实性"维度 | `unverified_classic_chunk_id` 问题码可量化引用错误率 |
 
-RAG 轨道总计约 1.5 周（v4 的 2-2.5 周因语料现成而缩短）。R1 可与 P3 并行（语料是纯数据工作，不碰代码）；R2-R3 在 P3 之后、P4 之前切入。**P1 的字典版照旧先上**——chat 链路不等数据工程。
+RAG 轨道 baseline 已在 2026-09-06 从 R1 推进到 R4：语料、检索、工具切换、流中 chunk_id 回验与离线引用真实性抽审均已有定向测试。剩余增强集中在 embedding/RRF 提升与真实追问样本校验。
 
 ### 6.6 RAG 评估集
 
@@ -253,8 +264,8 @@ RAG 轨道总计约 1.5 周（v4 的 2-2.5 周因语料现成而缩短）。R1 �
 | P1 工具层 | 1 周 | 4 个工具（字典版 classics）+ 单测 | 评估集：流年干支十神与引擎直算一致 |
 | P2 会话链路 | 1.5 周 | `/api/chat` + SqliteSaver + 追问框 + 幂等 + 删盘级联 | 跨请求续上上文；换盘不串扰；hid 越权 403；**删盘后 checkpoint/配额全清**；同 request_id 重发只回放不扣费 |
 | P3 生产化 | 1 周 | gate 原子扣+退款 + recursion_limit + 流中兜底 + 自动清理 + 观测日志 | 额度不足零 LLM 调用；工具失败自纠不崩且退款；误导表达率抽审跑通 |
-| R1-R4 RAG 轨道 | **约 1.5 周**（R1 与 P3 并行，v4.1 压缩） | 清洗脚本+语料 + 混合检索 + search_classics + grounding | 检索命中率 ≥80%；伪造引用被拦；对抗用例答"查无此文" |
-| P4 内测运营 | 1-2 周 | 埋点 + 体验码放量 + 简历改写 + README 3.1 合入 | 发 50-100 码、20+ 真实追问会话、helpful 采集；**对外口径全部锁"邀请制内测"** |
+| R1-R4 RAG 轨道 | **baseline 已完成（2026-09-06）** | 清洗脚本+语料 + 词法检索 baseline + search_classics + grounding + 抽审指标 | 检索命中率 100%（20 题 top-5）；伪造引用被拦；离线抽审可标记未验证 chunk_id |
+| P4 内测运营 | **in progress（2026-09-07）** | 体验码放量 + helpful 采集 + 命盘咨询 UI + 简历改写 + README 3.1 合入 | helpful 表/接口与用户侧咨询间首屏已接入；剩余发 50-100 码、20+ 真实追问会话；**对外口径全部锁"邀请制内测"** |
 
 总排期约 7 周（v4 估 8 周，R1 语料现成省 1 周）。
 
@@ -277,10 +288,10 @@ RAG 轨道总计约 1.5 周（v4 的 2-2.5 周因语料现成而缩短）。R1 �
 | 工具调用分布与成功率 | 自主推理证据 | agent 有效性 |
 | 每会话 token 成本 | 有硬上限 | 工程素养 |
 | 误导表达率（抽审口径） | 5% 离线判官复审为准，黑名单命中作交叉信号 | 输出质量北极星 |
-| 引用 grounding 通过率（R3 后） | 伪造引用拦截的量化 | 检索可信度 |
+| 引用 grounding 通过率（R4 后） | 流中保险丝 + 离线抽审 `unverified_classic_chunk_id` 问题码量化 | 检索可信度 |
 | 检索命中率（离线回归） | 20 组固定问题 | 检索质量 |
 | 体验码转化 | 发码→激活 | 增长（邀请制内测口径） |
-| 单键 helpful | 会话结束点赞/点踩 | 满意度 |
+| 单键 helpful | `/api/chat/feedback` 记录已完成追问的有用/没用评分 | 满意度 |
 
 ## 10. 简历产出
 

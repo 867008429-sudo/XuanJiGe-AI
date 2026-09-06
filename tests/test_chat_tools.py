@@ -1,6 +1,5 @@
 import unittest
 
-from bazi_knowledge import ALLOWED_CLASSIC_BOOKS
 from chat_tools import (
     EMPTY_NAME_TEXT,
     NAME_MAX_LEN,
@@ -60,7 +59,7 @@ class BuildChatToolsTests(unittest.TestCase):
     def test_four_readonly_tools(self):
         self.assertEqual(
             sorted(self.by_name),
-            ['lookup_classics', 'query_dayun', 'query_liunian', 'query_paipan'],
+            ['query_dayun', 'query_liunian', 'query_paipan', 'search_classics'],
         )
 
     def test_query_liunian_matches_engine(self):
@@ -85,31 +84,29 @@ class BuildChatToolsTests(unittest.TestCase):
         self.assertIn('最接近', out)
         self.assertIn('壬午', out)      # 距 5 岁最近的一步
 
-    def test_lookup_classics_hit(self):
-        out = self.by_name['lookup_classics'].invoke({'topic': '伤官'})
+    def test_search_classics_hit(self):
+        out = self.by_name['search_classics'].invoke({'query': '寒暖燥湿'})
         self.assertIn('命中', out)
-        self.assertIn('子平真诠', out)
-        self.assertIn('义理参考', out)
+        self.assertIn('chunk_id=', out)
+        self.assertIn('【', out)
+        self.assertIn('滴天髓', out)
 
-    def test_lookup_classics_wuxing_topic(self):
-        out = self.by_name['lookup_classics'].invoke({'topic': '金旺'})
+    def test_search_classics_short_wuxing_topic(self):
+        out = self.by_name['search_classics'].invoke({'query': '金旺'})
         self.assertIn('命中', out)
-        self.assertIn('穷通宝鉴', out)
+        self.assertIn('chunk_id=', out)
 
-    def test_lookup_classics_empty_topic(self):
-        out = self.by_name['lookup_classics'].invoke({'topic': '  '})
+    def test_search_classics_empty_topic(self):
+        out = self.by_name['search_classics'].invoke({'query': '  '})
         self.assertIn('查询主题为空', out)
 
-    def test_lookup_classics_miss_forbids_fabrication(self):
-        out = self.by_name['lookup_classics'].invoke({'topic': '不存在的绝密概念'})
-        self.assertIn('查无此条', out)
+    def test_search_classics_miss_forbids_fabrication(self):
+        out = self.by_name['search_classics'].invoke({'query': '滴天髓稳赚不赔原文'})
+        self.assertIn('查无此文', out)
         self.assertIn('不得编造', out)
         # 未命中输出绝不能伪装成命中结果
         self.assertNotIn('命中 1', out)
-        self.assertNotIn('触发=', out)
-        for book in ALLOWED_CLASSIC_BOOKS:
-            # 只能列白名单书目，不得暗示某书收录了该概念
-            self.assertIn(book, out)
+        self.assertNotIn('chunk_id=', out)
 
     def test_query_dayun_empty_dayun_data(self):
         tools = build_chat_tools({'four_pillars': {'day': {'gan': '甲'}}, 'dayun': []})

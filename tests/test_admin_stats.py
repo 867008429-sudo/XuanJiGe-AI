@@ -32,6 +32,8 @@ class AdminStatsTests(unittest.TestCase):
         self.assertIn('last_24h', data)
         self.assertIn('ai_requests', data['last_24h'])
         self.assertIn('top_registration_failure_reasons', data['last_24h'])
+        self.assertIn('chat_feedback', data)
+        self.assertIn('helpful_rate_percent', data['chat_feedback'])
 
 
 if __name__ == '__main__':

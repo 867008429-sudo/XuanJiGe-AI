@@ -12,11 +12,12 @@ P0 spike 的三条结论性发现全部落在这里：
 """
 import json
 import os
+import re
 import sqlite3
 import threading
 from typing import Annotated, Any, TypedDict
 
-from langchain_core.messages import AIMessage, AIMessageChunk, AnyMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, AnyMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -43,6 +44,7 @@ CHAT_MAX_TOKENS = int(os.environ.get('CHAT_MAX_TOKENS', '1500'))
 CHAT_TEMPERATURE = float(os.environ.get('CHAT_TEMPERATURE', '0.7'))
 CHAT_RECURSION_LIMIT = int(os.environ.get('CHAT_RECURSION_LIMIT', '25'))
 CHAT_BUSY_TIMEOUT_MS = int(os.environ.get('CHAT_BUSY_TIMEOUT_MS', '5000'))
+CLASSICS_CHUNK_ID_RE = re.compile(r'\b[a-z0-9]+(?:-[a-z0-9]+)*-ch\d{3}(?:-p\d{2})?\b')
 
 
 class ChatConfigError(RuntimeError):
@@ -75,6 +77,8 @@ def resolve_model_kwargs(persona=None):
         'model': (persona.model if persona and persona.model else _resolve_model_name()),
         'max_tokens': persona.max_tokens if persona else CHAT_MAX_TOKENS,
         'temperature': persona.temperature if persona else CHAT_TEMPERATURE,
+        'extra_body': {'thinking': {'type': 'disabled'}},
+        'stream_usage': True,
     }
 
 
@@ -127,9 +131,13 @@ def get_checkpointer():
 
 
 def reset_checkpointer():
-    """测试用：丢弃单例（不关连接，由测试自行清理临时目录）。"""
+    """测试/热重置用：关闭并丢弃 SqliteSaver 单例。"""
     global _checkpointer
+    saver = _checkpointer
     _checkpointer = None
+    conn = getattr(saver, 'conn', None)
+    if conn is not None:
+        conn.close()
 
 
 def delete_chat_thread(thread_id):
@@ -160,8 +168,8 @@ def build_chat_contract():
         '\n\n工具使用规则：'
         '1. 所有干支、十神、大运、流年数据必须通过工具获取（query_liunian / query_dayun），'
         '禁止自行推算历法或凭记忆报干支。'
-        '2. 用户问到古籍义理时先调用 lookup_classics；若返回"查无此条"，'
-        '必须如实告知查无此文，禁止编造原文、卷页或作者。'
+        '2. 用户问到古籍义理或原文出处时先调用 search_classics；若返回"查无此文"，'
+        '必须如实告知查无此文，禁止编造原文、卷页、作者或 chunk_id。'
         '3. 只有用户想临时看别人的盘时才用 query_paipan，并说明该结果不改变本会话命盘。'
         '4. 已有足够数据时直接回答，不为调工具而调工具。'
         '\n\n回答规范：'
@@ -169,7 +177,8 @@ def build_chat_contract():
         '2. 多轮连续性：回扣本轮对话已确认的事实（如刚查过的流年/大运），不重复查询已知数据。'
         '3. 每个判断回扣盘面证据（十神、五行、大运），不悬空断语。'
         '4. 禁止：投资收益保证、疾病诊断、婚姻绝对断语、恐吓式表达；健康话题只做养生级提醒。'
-        '5. 古籍引用只可署 lookup_classics 返回的书名，且只转述义理，不引用"原文"。'
+        '5. 古籍引用只可来自 search_classics 返回的 chunk；引用原文或篇名时必须附 chunk_id，'
+        '格式如【ditiansui-chanwei-ch029】。'
         '\n\n口吻：先答用户所问，再给一句可执行的提醒；不用 markdown 标题。'
     )
 
@@ -190,7 +199,7 @@ class ChatState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     paipan_digest: str        # 独立字段而非消息（spike 发现 1：system 排序问题）
     birth_info: dict          # 生辰+性别（gate 注入，schema 对齐 §4.1）
-    chat_quota_left: int      # 剩余追问数（路由层每次 invoke 时更新）
+    chat_quota_left: int      # 剩余香火炷数（路由层每次 invoke 时更新）
     persona_id: str           # 本回合生效人格（记录用途；换人不锁死会话，§4.2）
     retrieved_chunks: list    # R3 Agentic RAG 轨道的 grounding 预留位
 
@@ -259,6 +268,30 @@ def chat_invoke_config(thread_id):
     }
 
 
+def _content_text(content):
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get('type') or '').lower()
+        if block_type in {'reasoning', 'reasoning_content', 'thinking'}:
+            continue
+        text = block.get('text', block.get('content', ''))
+        if isinstance(text, dict):
+            text = text.get('value', '')
+        if isinstance(text, str):
+            parts.append(text)
+    return ''.join(parts)
+
+
 def parse_stream_event(event):
     """把 stream_mode="messages" 的事件解析为可序列化的 SSE 载荷。
 
@@ -281,10 +314,42 @@ def parse_stream_event(event):
             return {'type': 'tool', 'name': names[0]}
         return None
     if isinstance(msg, (AIMessage, AIMessageChunk)):
-        content = getattr(msg, 'content', None)
-        if content:
-            return {'type': 'token', 'text': str(content)}
+        text = _content_text(getattr(msg, 'content', None))
+        if text:
+            return {'type': 'token', 'text': text}
     return None
+
+
+def extract_chunk_ids(text):
+    """Extract normalized RAG chunk ids from model or tool text."""
+    return sorted(set(CLASSICS_CHUNK_ID_RE.findall(str(text or '').lower())))
+
+
+def extract_retrieved_chunk_ids(event):
+    """Collect chunk ids returned by the `search_classics` ToolMessage."""
+    if not (isinstance(event, tuple) and len(event) == 2):
+        return []
+    msg, _meta = event
+    if isinstance(msg, ToolMessage) and getattr(msg, 'name', '') == 'search_classics':
+        return extract_chunk_ids(getattr(msg, 'content', ''))
+    return []
+
+
+def validate_grounded_citations(reply_text, retrieved_chunk_ids):
+    """Validate that cited chunk ids are a subset of this turn's retrieved ids.
+
+    This is the R3 grounding primitive. The streaming route can use it after a
+    turn, and offline audit can reuse the same shape later for citation metrics.
+    """
+    cited = set(extract_chunk_ids(reply_text))
+    retrieved = set(str(item).lower() for item in (retrieved_chunk_ids or []))
+    missing = sorted(cited - retrieved)
+    return {
+        'ok': not missing,
+        'cited_chunk_ids': sorted(cited),
+        'retrieved_chunk_ids': sorted(retrieved),
+        'missing_chunk_ids': missing,
+    }
 
 
 def dump_sse(payload):

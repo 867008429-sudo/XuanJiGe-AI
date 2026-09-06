@@ -112,8 +112,8 @@ class PromptPartitionTests(unittest.TestCase):
         contract = build_chat_contract()
         # 工具规则与安全边界（对抗越界的判据，M5 评测依赖这些锚点）
         for anchor in (
-            '工具使用规则', 'query_liunian', 'lookup_classics',
-            '禁止自行推算历法', '禁止编造原文',
+            '工具使用规则', 'query_liunian', 'search_classics',
+            '禁止自行推算历法', '禁止编造原文', 'chunk_id',
             '回答规范', '投资收益保证', '疾病诊断', '恐吓式表达',
             '先答用户所问', '不用 markdown 标题',
         ):

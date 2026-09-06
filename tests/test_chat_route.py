@@ -6,6 +6,7 @@
 """
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -241,6 +242,50 @@ class ChatRouteTests(unittest.TestCase):
         self.assertEqual(8, saved['quota_left'])
         self.assertEqual(2, saved['price'])
         self.assertEqual('qingxu', saved['persona'])
+        log = db.get_chat_usage_logs(thread_id)[0]
+        self.assertEqual('ok', log['status'])
+        self.assertEqual('qingxu', log['persona'])
+        self.assertEqual(2, log['price'])
+        self.assertEqual(8, log['quota_left'])
+        self.assertEqual(0, log['cached'])
+        self.assertEqual(1, log['tool_calls'])
+        self.assertEqual(0, log['safety_triggered'])
+
+    def test_usage_metadata_logged_without_sse_leak(self):
+        """P3 token 入账：usage-only chunk 不外发，只进入 usage 账本。"""
+        self.fake = FakeGraph(events=[
+            (AIMessageChunk(
+                content='',
+                usage_metadata={'input_tokens': 11, 'output_tokens': 22, 'total_tokens': 33},
+            ), {}),
+            (AIMessageChunk(content='丁未年'), {}),
+        ])
+        chat_graph.build_chat_graph.return_value = self.fake
+
+        resp = self._post_chat()
+
+        events = parse_sse(resp.get_data(as_text=True))
+        self.assertEqual(
+            [{'type': 'token', 'text': '丁未年'},
+             {'type': 'done', 'quota_left': 8, 'price': 2, 'persona': 'qingxu',
+              'request_id': 'req-001', 'cached': False}],
+            events,
+        )
+        thread_id = db.build_chat_thread_id(self.fingerprint, self.hid)
+        log = db.get_chat_usage_logs(thread_id)[0]
+        self.assertEqual(11, log['prompt_tokens'])
+        self.assertEqual(22, log['completion_tokens'])
+        self.assertEqual(33, log['total_tokens'])
+        self.assertGreater(log['cost_usd'], 0)
+
+        conn = sqlite3.connect(db.DB_PATH)
+        usage = conn.execute(
+            "SELECT endpoint, cache_hit, tokens_used, cost_usd FROM usage_logs "
+            "WHERE endpoint = '/api/chat' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(('/api/chat', 0, 33), usage[:3])
+        self.assertGreater(usage[3], 0)
 
     def test_persona_charged_its_own_price(self):
         """请教掌门真人按注册表定价扣 5 炷，done 事件如实记账。"""
@@ -267,6 +312,52 @@ class ChatRouteTests(unittest.TestCase):
         # 10 - 1 - 5 - 2 = 2 炷
         self.assertEqual(2, db.get_chat_quota_left(self.hid, self.fingerprint))
 
+    def test_superuser_chat_does_not_consume_quota(self):
+        self.assertTrue(db.set_account_superuser('alice'))
+
+        resp = self._post_chat(persona='zhangmen')
+
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual(str(db.SUPERUSER_CHAT_QUOTA_LEFT), resp.headers['X-Quota-Left'])
+        self.assertEqual('true', resp.headers['X-Unlimited-Quota'])
+        self.assertEqual(
+            db.SUPERUSER_CHAT_QUOTA_LEFT,
+            db.get_chat_quota_left(self.hid, self.fingerprint),
+        )
+        events = parse_sse(resp.get_data(as_text=True))
+        done = events[-1]
+        self.assertTrue(done['unlimited'])
+        self.assertEqual(db.SUPERUSER_CHAT_QUOTA_LEFT, done['quota_left'])
+        self.assertEqual(5, done['price'])
+        self.assertEqual('zhangmen', done['persona'])
+        self.assertEqual(
+            db.SUPERUSER_CHAT_QUOTA_LEFT,
+            self.fake.stream_calls[0]['input']['chat_quota_left'],
+        )
+
+        conn = db.get_db()
+        row = conn.execute(
+            'SELECT used FROM chat_followups WHERE hid = ? AND fingerprint = ?',
+            (self.hid, self.fingerprint),
+        ).fetchone()
+        conn.close()
+        self.assertIsNone(row)
+
+    def test_superuser_chat_quota_endpoint_reports_unlimited(self):
+        self.assertTrue(db.set_account_superuser('alice'))
+
+        resp = self.client.get(
+            f'/api/chat/quota?hid={self.hid}',
+            headers={'Authorization': f'Bearer {self.token}'},
+        )
+
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual({
+            'hid': self.hid,
+            'quota_left': db.SUPERUSER_CHAT_QUOTA_LEFT,
+            'limit': db.CHAT_FREE_INCENSE,
+            'unlimited': True,
+        }, resp.get_json())
     def test_idempotent_replay_does_not_recharge_or_restream(self):
         self._post_chat()
         used_before = db.get_chat_quota_left(self.hid, self.fingerprint)
@@ -287,6 +378,11 @@ class ChatRouteTests(unittest.TestCase):
         self.assertEqual(1, len(done))
         self.assertTrue(done[0]['cached'])
         self.assertEqual(8, done[0]['quota_left'])
+        thread_id = db.build_chat_thread_id(self.fingerprint, self.hid)
+        log = db.get_chat_usage_logs(thread_id)[0]
+        self.assertEqual('replay', log['status'])
+        self.assertEqual(1, log['cached'])
+        self.assertEqual('qingxu', log['persona'])
 
     def test_replay_done_carries_cached_price_and_persona(self):
         """断线重发同 request_id：回放的是当时那位道长的回复与账目（§5.3）。"""
@@ -327,6 +423,10 @@ class ChatRouteTests(unittest.TestCase):
         self.assertEqual('香火不足', body['error'])
         self.assertEqual(2, body['persona_price'])
         self.assertEqual([], self.fake.stream_calls)
+        log = db.get_chat_usage_logs(db.build_chat_thread_id(self.fingerprint, self.hid))[0]
+        self.assertEqual('quota_exhausted', log['status'])
+        self.assertEqual(0, log['quota_left'])
+        self.assertEqual(2, log['price'])
 
     def test_403_detail_when_price_exceeds_balance(self):
         """余额够问便宜道长、不够请教掌门：403 明细让用户失败得明白（§5.2）。"""
@@ -361,6 +461,140 @@ class ChatRouteTests(unittest.TestCase):
         self.assertEqual(10, db.get_chat_quota_left(self.hid, self.fingerprint))
         thread_id = db.build_chat_thread_id(self.fingerprint, self.hid)
         self.assertIsNone(db.get_chat_reply(thread_id, 'req-001'))
+        log = db.get_chat_usage_logs(thread_id)[0]
+        self.assertEqual('error', log['status'])
+        self.assertEqual('RuntimeError', log['error_type'])
+        self.assertEqual(10, log['quota_left'])
+
+    def test_empty_ai_reply_refunds_quota_and_is_not_cached(self):
+        self.fake = FakeGraph(events=[
+            (AIMessageChunk(
+                content='',
+                usage_metadata={
+                    'input_tokens': 12,
+                    'output_tokens': 34,
+                    'total_tokens': 46,
+                },
+            ), {}),
+        ])
+        chat_graph.build_chat_graph.return_value = self.fake
+
+        resp = self._post_chat()
+
+        self.assertEqual(200, resp.status_code)
+        events = parse_sse(resp.get_data(as_text=True))
+        self.assertEqual('error', events[-1]['type'])
+        self.assertEqual(app_module.CHAT_EMPTY_REPLY_MESSAGE, events[-1]['message'])
+        self.assertEqual(10, events[-1]['quota_left'])
+        thread_id = db.build_chat_thread_id(self.fingerprint, self.hid)
+        self.assertEqual(10, db.get_chat_quota_left(self.hid, self.fingerprint))
+        self.assertIsNone(db.get_chat_reply(thread_id, 'req-001'))
+        log = db.get_chat_usage_logs(thread_id)[0]
+        self.assertEqual('empty_reply', log['status'])
+        self.assertEqual('EmptyReply', log['error_type'])
+        self.assertEqual(46, log['total_tokens'])
+        self.assertEqual(10, log['quota_left'])
+
+    def test_stream_safety_fuse_blocks_cross_chunk_risky_phrase(self):
+        """P3 流中兜底：危险短语跨 token 出现时，完整短语不得外发或落库。"""
+        self.fake = FakeGraph(events=[
+            (AIMessageChunk(content='这事'), {}),
+            (AIMessageChunk(content='稳赚'), {}),
+            (AIMessageChunk(content='不赔，别犹豫。'), {}),
+        ])
+        chat_graph.build_chat_graph.return_value = self.fake
+
+        resp = self._post_chat()
+
+        self.assertEqual(200, resp.status_code)
+        events = parse_sse(resp.get_data(as_text=True))
+        text = ''.join(e.get('text', '') for e in events if e['type'] == 'token')
+        self.assertIn('这事', text)
+        self.assertIn('不能下绝对断语', text)
+        self.assertNotIn('稳赚', text)
+        self.assertNotIn('不赔', text)
+        self.assertEqual('done', events[-1]['type'])
+        # 安全保险丝截断的是输出，不是 AI 调用失败：不退款，但落安全回复供幂等回放
+        self.assertEqual(8, db.get_chat_quota_left(self.hid, self.fingerprint))
+        saved = db.get_chat_reply(db.build_chat_thread_id(self.fingerprint, self.hid), 'req-001')
+        self.assertIsNotNone(saved)
+        self.assertIn('不能下绝对断语', saved['reply_text'])
+        self.assertNotIn('稳赚', saved['reply_text'])
+        log = db.get_chat_usage_logs(db.build_chat_thread_id(self.fingerprint, self.hid))[0]
+        self.assertEqual('safety', log['status'])
+        self.assertEqual(1, log['safety_triggered'])
+        self.assertEqual(0, log['cached'])
+
+    def test_stream_safety_fuse_blocks_single_chunk_risky_phrase(self):
+        self.fake = FakeGraph(events=[
+            (AIMessageChunk(content='你必定发财，这事不用犹豫。'), {}),
+        ])
+        chat_graph.build_chat_graph.return_value = self.fake
+
+        resp = self._post_chat()
+
+        events = parse_sse(resp.get_data(as_text=True))
+        text = ''.join(e.get('text', '') for e in events if e['type'] == 'token')
+        self.assertIn('不能下绝对断语', text)
+        self.assertNotIn('必定发财', text)
+        self.assertEqual('done', events[-1]['type'])
+
+    def test_grounding_allows_retrieved_chunk_id(self):
+        self.fake = FakeGraph(events=[
+            (AIMessageChunk(
+                content='',
+                tool_call_chunks=[{
+                    'name': 'search_classics',
+                    'args': '{"query"',
+                    'id': 'call_search',
+                    'index': 0,
+                }],
+            ), {}),
+            (ToolMessage(
+                content='1. chunk_id=ditiansui-chanwei-ch029；可引用格式=【ditiansui-chanwei-ch029】',
+                name='search_classics',
+                tool_call_id='call_search',
+            ), {}),
+            (AIMessageChunk(content='寒暖一节见【ditiansui-chanwei-ch029】，只作义理参考。'), {}),
+        ])
+        chat_graph.build_chat_graph.return_value = self.fake
+
+        resp = self._post_chat()
+
+        events = parse_sse(resp.get_data(as_text=True))
+        text = ''.join(e.get('text', '') for e in events if e['type'] == 'token')
+        self.assertIn({'type': 'tool', 'name': 'search_classics'}, events)
+        self.assertIn('【ditiansui-chanwei-ch029】', text)
+        saved = db.get_chat_reply(db.build_chat_thread_id(self.fingerprint, self.hid), 'req-001')
+        self.assertIn('【ditiansui-chanwei-ch029】', saved['reply_text'])
+        self.assertEqual(['ditiansui-chanwei-ch029'], saved['retrieved_chunk_ids'])
+        log = db.get_chat_usage_logs(db.build_chat_thread_id(self.fingerprint, self.hid))[0]
+        self.assertEqual('ok', log['status'])
+        self.assertEqual(1, log['tool_calls'])
+        self.assertEqual(0, log['safety_triggered'])
+
+    def test_grounding_fuse_blocks_cross_chunk_fake_chunk_id(self):
+        self.fake = FakeGraph(events=[
+            (AIMessageChunk(content='寒暖可见【fake-'), {}),
+            (AIMessageChunk(content='book-ch001】，照此断。'), {}),
+        ])
+        chat_graph.build_chat_graph.return_value = self.fake
+
+        resp = self._post_chat()
+
+        events = parse_sse(resp.get_data(as_text=True))
+        text = ''.join(e.get('text', '') for e in events if e['type'] == 'token')
+        self.assertIn(app_module.CHAT_GROUNDING_FALLBACK, text)
+        self.assertNotIn('fake-book-ch001', text)
+        self.assertEqual('done', events[-1]['type'])
+        self.assertEqual(8, db.get_chat_quota_left(self.hid, self.fingerprint))
+        saved = db.get_chat_reply(db.build_chat_thread_id(self.fingerprint, self.hid), 'req-001')
+        self.assertNotIn('fake-book-ch001', saved['reply_text'])
+        self.assertIn(app_module.CHAT_GROUNDING_FALLBACK, saved['reply_text'])
+        self.assertEqual([], saved['retrieved_chunk_ids'])
+        log = db.get_chat_usage_logs(db.build_chat_thread_id(self.fingerprint, self.hid))[0]
+        self.assertEqual('safety', log['status'])
+        self.assertEqual(1, log['safety_triggered'])
 
     def test_chat_config_error_returns_503(self):
         self.build_patcher.stop()

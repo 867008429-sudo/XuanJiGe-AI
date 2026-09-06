@@ -17,6 +17,10 @@ services:
       - ./db.py:/app/db.py
       - ./chat_tools.py:/app/chat_tools.py
       - ./chat_graph.py:/app/chat_graph.py
+      - ./classics_search.py:/app/classics_search.py
+      - ./chat_audit.py:/app/chat_audit.py
+      - ./chat_cleanup.py:/app/chat_cleanup.py
+      - ./data/classics:/app/data/classics:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://127.0.0.1:8888/health', timeout=3)"]
       interval: 30s

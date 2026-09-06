@@ -1,7 +1,7 @@
-# 玄机阁 · AI 八字排盘 Demo
+# 玄机阁 · AI 八字排盘命盘咨询 Demo
 
-> 天文历法精确排盘 + DeepSeek 大模型流式解读的命理 Web 应用
-> 一个"计算与生成分离"的 AI First 小型全栈 Demo
+> 天文历法精确排盘 + DeepSeek 大模型流式解读 + LangGraph 多轮追问的命理 Web 应用
+> 一个"计算与生成分离"并带 Agentic RAG 可信引用闭环的 AI First 小型全栈 Demo
 
 **在线 Demo**：部署后建议绑定域名并启用 HTTPS，例如 `https://your-domain.com`
 
@@ -10,8 +10,9 @@
 ## 功能特性
 
 - **精确排盘**：基于寿星天文历（sxtwl），公历转农历、节气换月令精确到分钟，四柱/十神/五行/神煞/大运全量计算
+- **命盘咨询 UI**：首页按“左侧建盘/历史、中间追问咨询间、底部咨询说明”重排，让用户先进入可追问体验，而不是看到工具面板或后台指标
 - **AI 流式解读**：DeepSeek V4 Flash 逐字流式输出（SSE），证据驱动 Prompt 要求每个判断回扣月令、十神、藏干、五行、冲合与当前大运
-- **多轮追问（Agent）**：看完解读后可对命盘连续追问（LangGraph 工具调用），流年/大运等事实由本地工具实时计算，模型只负责表达；每盘 5 次免费追问，断线重发走幂等回放不重复计次
+- **多轮追问（Agent）**：看完解读后可对命盘连续追问（LangGraph 工具调用），流年/大运等事实由本地工具实时计算，模型只负责表达；每盘赠 10 炷香火，五位道长按档位消耗 1/2/5 炷，断线重发走幂等回放不重复计香
 - **账号体系**：注册/登录，新用户 5 次免费 AI 解读；同一命盘二次查看走缓存，**永远不重复扣费**
 - **历史记录**：按账号隔离，访客排过的盘在注册后自动迁移到账号名下；删盘级联清空追问数据（隐私合规）
 - **成本可控**：单次解读 token 用量与成本可统计，缓存命中为 ¥0
@@ -31,7 +32,7 @@
 ```
 ┌─────────────────────────────────────────────────────┐
 │              前端（单页 · 内嵌于 app.py）              │
-│   道教古典风 UI · fetch 读取 SSE 流 · 响应式布局       │
+│   命盘咨询 UI · fetch 读取 SSE 流 · 响应式布局        │
 └──────────────────────┬──────────────────────────────┘
                        │ HTTP / SSE
 ┌──────────────────────▼──────────────────────────────┐
@@ -49,7 +50,7 @@
 ┌───────▼────────┐    ┌──────────▼─────────────────────┐
 │   引擎层        │    │            服务层               │
 │ bazi_engine.py │    │ db.py（SQLite）                 │
-│ · 公历→农历     │    │ · 账号/会话/配额（5次免费）      │
+│ · 公历→农历     │    │ · 账号/会话/AI解读配额（5次免费）│
 │ · 四柱/十神     │    │ · AI 结果缓存（账号维度隔离）    │
 │ · 五行/神煞     │    │ · 历史记录与迁移                │
 │ · 大运/起运     │    │ · chat 追问额度/幂等/级联删除   │
@@ -68,7 +69,7 @@
 
 | 文件 | 职责 |
 |------|------|
-| `app.py` | 主入口：Flask 路由 + 内嵌前端页面（HTML/CSS/JS 单文件交付） |
+| `app.py` | 主入口：Flask 路由 + 内嵌命盘咨询前端（HTML/CSS/JS 单文件交付） |
 | `bazi_engine.py` | 八字排盘核心算法：历法转换、四柱、十神、格局、大运、神煞 |
 | `db.py` | SQLite 数据层：账号、会话、配额、缓存、历史、用量日志 |
 | `ai_context.py` | 命盘上下文层：把排盘结果整理成稳定 schema，标记当前年龄与当前大运 |
@@ -77,8 +78,13 @@
 | `ai_client.py` | 模型客户端层：DeepSeek/OpenAI 兼容请求、参数校验、流式解析和有限重试 |
 | `ai_validator.py` | 质量闸门：检查板块完整性、盘面证据、风险表达和输出长度 |
 | `ai_service.py` | AI 编排层：串联 context/prompt/client/validator，处理缓存、成本和 SSE 输出 |
-| `chat_tools.py` | 追问 agent 的工具层：流年/大运/古籍/临时排盘 4 个只读工具，姓名清洗防注入 |
+| `chat_tools.py` | 追问 agent 的工具层：流年/大运/古籍检索/临时排盘 4 个只读工具，姓名清洗防注入 |
 | `chat_graph.py` | 追问 agent 的图编排：LangGraph 状态图、checkpointer、SSE 事件解析 |
+| `classics_search.py` | Agentic RAG 的 R2 检索基线：本地 BM25 + 字元 n-gram，返回可回验 `chunk_id` |
+| `data/classics/` | R1 古籍原文 JSONL 语料：7 本、1025 chunks、约 118.6 万字，含来源与版权边界声明 |
+| `tools/build_classics_corpus.py` | R1 语料清洗脚本：剥离译文、水印与页码，只保留公版原文段落 |
+| `tools/build_classics_index.py` | R2/R3 检索索引 smoke：构建本地索引并查看指定 query 的 top-k 命中 |
+| `tools/eval_classics_search.py` | R2 检索评估脚本：20 组固定问题，验证 top-k 命中文献 |
 | `tests/` `tools/` | 单元测试与 20 个固定命盘样本预检脚本 |
 | `Dockerfile` | 生产镜像（gunicorn + gevent，支持 SSE 长连接） |
 | `docker-compose.yml` | 一键部署 + 数据卷持久化 + 健康检查 |
@@ -104,13 +110,13 @@
       → 标记历史"已解读" → 扣配额（AI 失败则不扣）
 ```
 
-**chat 追问链路（每盘 5 次免费、SSE 流式、LangGraph agent）**
+**chat 追问链路（每盘 10 炷香火、SSE 流式、LangGraph agent）**
 
 ```
 用户在结果页追问 → 校验登录态 + 命盘归属（hid 必须属于当前账号）
 → 查幂等表（thread_id = 服务端拼接 账号:hid + 客户端 request_id）
-   ├─ 命中 → 免费回放已保存回复，不再扣次数
-   └─ 未命中 → 编译对话图 → 原子扣减追问额度（并发不可能双花）
+   ├─ 命中 → 免费回放已保存回复，不再扣香火
+   └─ 未命中 → 编译对话图 → 按所选道长价格原子扣减香火额度（并发不可能双花）
       → graph.stream(stream_mode="messages") 逐事件转发
       → 模型按需调用只读工具（流年/大运/古籍/临时排盘）
       → 完成后回复落幂等表；AI 异常退款
@@ -122,10 +128,13 @@
 |------|------|
 | 事实走工具，不走记忆 | 模型被禁止自行推算干支；query_liunian 等工具实时调本地引擎，杜绝历法幻觉 |
 | thread_id 服务端拼接 | 会话粒度 = 账号指纹:命盘id，客户端无法指定或窥探他人会话 |
-| request_id 幂等回放 | 断线重发同一 request_id 只回放已保存回复，不重复扣次数 |
-| 原子额度扣减 + 失败退款 | SQLite 单条 UPDATE 完成检查+扣减，多进程并发不双花；AI 异常自动退回 |
+| request_id 幂等回放 | 断线重发同一 request_id 只回放已保存回复，不重复计香 |
+| 香火原子扣减 + 失败退款 | SQLite 单条 UPDATE 完成检查+扣减，多进程并发不双花；AI 异常自动退回 |
 | digest 存独立 state 字段 | 命盘摘要每回合前置进 system prompt，不进会话历史，永不重复、永不乱序 |
 | 删盘级联 | 删除历史记录时同步清空追问额度、对话记录与 checkpoint（生辰属敏感个人信息） |
+| 流中安全兜底 | 对 `RISKY_PHRASES` 做滑动短句检测，命中后截断危险输出并换安全收尾 |
+| 5% 离线抽审 | `tools/audit_chat_replies.py` 稳定抽样已保存回复，本地判官记录 verdict / issue code / 回复哈希 |
+| 自动清理 | Docker 默认每日清理 30 天以上 chat checkpoint / 幂等回放 / 观测日志 / 抽审日志，不重置香火额度 |
 
 ### 1.4 设计原则：计算与生成分离
 
@@ -207,11 +216,13 @@ AI 只负责**非确定性的表达**（解读、比喻、古籍引用）。
 - **`← 当前大运` 标记 + 当前年龄**：解决早期版本"AI 把 43-52 岁大运当成当下"的问题——模型不知道"现在"是哪年，必须显式告知
 - **补充藏干/纳音/支神/五行占比**：把模型最容易漏看的“证据”前置，减少只看天干十神就下结论的问题
 
-### 2.3 轻量知识库（先规则表，不急着 RAG）
+### 2.3 轻量知识库与 RAG 轨道
 
 `bazi_knowledge.py` 会根据命盘上下文选择少量可引用片段，例如身弱取用、伤官格、当前大运十神、五行偏旺/偏弱、地支刑冲合害。Prompt 中只给模型这些命中的义理卡片，并明确：**这些不是逐字古籍原文，只能转述义理，不得编造卷页、作者信息或不存在的书名。**
 
-这样做的原因是：当前 Demo 的内容量还不需要向量数据库，直接上 RAG 会增加部署和评测复杂度。先用规则知识表能快速提升稳定性，也方便用 20 个固定样本评估每次 Prompt/知识库升级是否真的变好。
+报告链路仍使用这套规则知识表，保持单轮解读路径稳定；chat 追问链路已在 R3 baseline 切到 `search_classics`：`data/classics/` 存放 7 本公版古籍原文 JSONL，`classics_search.py` 提供本地 BM25 + 字元 n-gram 检索，`tools/eval_classics_search.py` 用 20 组固定问题验证命中率。
+
+R3 grounding 的约束是：`search_classics` 返回 `chunk_id`，模型引用古籍原文或篇名时必须写成 `【chunk_id】`；流式输出若出现未检索过的 `chunk_id`，后端会截断并换成“查无可靠出处”的安全话术。当前阶段刻意不引入向量数据库；约千级 chunks 用进程内检索足够，流量与评估需求上来后再接 embedding 或 sqlite-vec。
 
 ### 2.4 Vibe 思路：我怎么和 AI 结对，把一个兴趣做成上线产品
 
@@ -323,6 +334,7 @@ cache_key = SHA256(账号指纹)[:32] + ':' + MD5(prompt版本 + 模型 + thinki
 | AI 调用失败不扣配额 | 配额在流式成功结束后才落库，失败路径零消耗 |
 | 新用户 5 次免费 | 注册即得，配额状态实时显示在顶部徽章 |
 | 数据库体验码 | 可生成一次性或多次使用体验码，注册成功后同事务消耗，管理员统计可看剩余量 |
+| 追问 helpful | chat 回复完成后可点“有用/没用”，只记录 request 级评分元数据，不保存正文 |
 
 ```bash
 # 生成 100 个一次性体验码并写入当前 DB
@@ -376,11 +388,15 @@ vi .env
 # DEEPSEEK_STRUCTURE_REPAIR_RETRIES=2
 # ADMIN_TOKEN=replace-with-a-long-random-admin-token
 # LOG_LEVEL=INFO
+# CHAT_CLEANUP_ENABLED=1  # Docker 默认开启：每日清理 30 天以上 chat 数据
 # ALLOWED_ORIGINS=https://your-domain.com
 # BACKUP_DIR=/app/backups
 
 # 3. 上线前预检
 python tools/preflight.py
+python tools/cleanup_chat_data.py --dry-run
+python tools/audit_chat_replies.py --dry-run
+python tools/eval_classics_search.py --k 5
 
 # 4. 启动（首次会自动构建镜像）
 docker compose up -d
@@ -498,8 +514,8 @@ git log --oneline -5
 |------|------|------|----------|
 | `/api/paipan` | POST | 八字排盘（含日期合法性校验，返回 history_id） | 否 |
 | `/api/interpret` | POST | AI 流式解读（SSE，未登录 401） | 是（缓存/失败除外） |
-| `/api/chat` | POST | 多轮追问（SSE，request_id 幂等，未登录 401） | 追问额度（每盘 5 次） |
-| `/api/chat/quota` | GET | 查询某命盘剩余追问次数 | 否 |
+| `/api/chat` | POST | 多轮追问（SSE，request_id 幂等，未登录 401） | 香火额度（每盘 10 炷） |
+| `/api/chat/quota` | GET | 查询某命盘剩余香火 | 否 |
 | `/api/chat/history` | GET | 从 checkpoint 恢复对话显示 | 否 |
 | `/api/register` `/api/login` `/api/logout` | POST | 账号体系 | 否 |
 | `/api/quota` `/api/me` | GET | 配额 / 会话查询 | 否 |
@@ -507,7 +523,7 @@ git log --oneline -5
 | `/health` | GET | 健康检查 | 否 |
 | `/api/stats` | GET | 管理统计（需 `ADMIN_TOKEN`） | 否 |
 
-chat SSE 事件格式：`{"type":"token","text":...}`（正文增量）、`{"type":"tool","name":...}`（工具调用提示）、`{"type":"done","quota_left":N,"cached":bool}`、`{"type":"error","message":...}`（额度已退回）。
+chat SSE 事件格式：`{"type":"token","text":...}`（正文增量）、`{"type":"tool","name":...}`（工具调用提示）、`{"type":"done","quota_left":N,"persona":"tiekou","price":2,"cached":bool,"request_id":"..."}`、`{"type":"error","message":...}`（香火已退回）。
 
 ## 技术栈
 
@@ -523,9 +539,12 @@ chat SSE 事件格式：`{"type":"token","text":...}`（正文增量）、`{"typ
 
 ## 已知边界
 
-- **追问断流重发**：断线时模型已生成部分文本会被保存，重发同一 request_id 走回放不重复计次；但若断流时一个字未生成（已退款），重发会在对话历史上出现一次重复的用户消息，模型仍会正常作答（P1 接受，checkpoint 回滚留待后续优化）。
+- **追问断流重发**：断线时模型已生成部分文本会被保存，重发同一 request_id 走回放不重复计香；但若断流时一个字未生成（已退款），重发会在对话历史上出现一次重复的用户消息，模型仍会正常作答（P1 接受，checkpoint 回滚留待后续优化）。
 - **无 API key 环境**：`DEEPSEEK_API_KEY` 缺失时追问与对话历史恢复均返回 503（报告解读同样不可用），排盘不受影响。
-- **chat 用量日志**：追问链路暂未记录 token 明细（`usage_logs` 记 0），成本核算以报告链路为准。
+- **chat 用量日志**：追问链路已记录 persona、price、quota_left、cached、status、tool_calls、safety_triggered 等元数据；若 LangChain chunk 暴露 `usage_metadata`，同步记录 prompt/completion/total tokens 与估算成本，否则保持 0。
+- **chat helpful 反馈**：`/api/chat/feedback` 只接受已完成并落库的追问回复；`chat_feedback` 表只存 fingerprint、hid、thread_id、request_id、rating 和时间，不存用户问题或回复正文。
+- **离线抽审**：当前 `heuristic-v1` 覆盖黑名单、常见变体与引用真实性；若回复引用的 `chunk_id` 不在本轮保存的 `search_classics` 检索白名单内，会记录 `unverified_classic_chunk_id`。审计表只存 verdict、issue code 与回复哈希；LLM-as-judge 仍留作后续增强。
+- **Agentic RAG 接入状态**：`/api/chat` 已切到 `search_classics` baseline，并启用流中未检索 `chunk_id` 保险丝；`chat_requests` 只额外保存本轮检索到的 `chunk_id` JSON 白名单供离线抽审回验。当前仍是词法检索，不冒充 embedding/RRF 混合检索。
 - **同盘并发追问**：同一命盘的两个并发请求可能产生 checkpoint 状态竞争，单人单盘场景概率极低，P1 不做锁。
 
 ## 后续路线
@@ -533,11 +552,11 @@ chat SSE 事件格式：`{"type":"token","text":...}`（正文增量）、`{"typ
 | 方向 | 计划 | 价值 |
 |------|------|------|
 | 结构化报告 JSON | 将结构化骨架中的 `summary/evidence/advice/risk` 直接返回给前端 | 减少从长文解析的脆弱性，让报告卡片更稳定 |
-| Admin 可视化 | 在受保护后台展示注册、调用、缓存、成本、失败原因和体验码状态 | 从 Demo 变成可运营产品，方便小范围真实验证 |
+| Admin 可视化 | 在受保护后台展示注册、调用、缓存、成本、失败原因、体验码和 helpful 状态 | 从 Demo 变成可运营产品，方便小范围真实验证 |
 | 评测样本扩容 | 从 20 个固定样本扩展到 50-100 个典型命盘，比较 Prompt 版本效果 | 避免靠主观感觉调 Prompt，让 AI 质量可回归 |
 | 报告长图/分享页 | 生成隐私脱敏的报告长图或只读分享链接 | 提高传播感，也能作为作品集展示素材 |
-| 知识库升级 | 继续扩充可追溯命理知识片段，评测稳定后再考虑轻量 RAG | 提升专业感，同时控制古籍引用幻觉 |
-| 追问链路增强 | checkpoint 回滚修复断流重发边界；token 用量入账；追问转付费额度 | 追问链路从 P1 走向可运营 |
+| Agentic RAG 增强 | R4 baseline 已接入；下一步补 embedding/RRF 或 sqlite-vec，并用真实追问样本压测引用质量 | 提升专业感，把古籍引用从“黑名单防伪”升级为“可验证出处” |
+| 追问链路增强 | checkpoint 回滚修复断流重发边界；LLM-as-judge 抽审升级；追问转付费额度 | 追问链路从 baseline 走向可运营 |
 | 域名与 HTTPS | 正式对外试用时绑定域名、启用证书，并收紧 CORS 白名单 | 提升信任、安全和访问专业度 |
 
 ## License
