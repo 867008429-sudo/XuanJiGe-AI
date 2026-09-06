@@ -50,3 +50,10 @@
 - README 重写：新增干净项目首页，放入公网体验地址 `http://129.204.102.108:8888/`、项目亮点、仓库结构、快速启动、Docker 部署、常用命令、API 概览和文档索引。
 - 对抗性审查：公网 Demo 地址是用户要求公开的 README 信息，因此从 `tools/preflight.py` 的敏感信息扫描中移除固定 IP 检查；PAT/API key/SSH 密码/超级账号密码仍继续扫描与禁止入库。
 - 仓库整理验证：`py_compile` 通过；`.venv` 下 `tools/preflight.py` required checks 通过，仅 `ADMIN_TOKEN` 未配置为 optional warn；full unittest 210 项通过；敏感信息扫描无 GitHub PAT/API key/SSH 密码；`git diff --check` 仅 Windows 行尾提示。
+
+## S20 README Agent 截图更新
+
+- 根据用户反馈，旧 README 图只展示排盘入口，不足以表达 Agent 追问能力。
+- 生成新版 `docs/screenshot-agent-chat.png`：使用真实 `/api/paipan` 排盘数据进入命盘咨询状态，并在现有前端组件中展示用户追问、道长回复、persona 选择与 helpful 反馈按钮。
+- README 主图已从 `docs/screenshot-landing.png` 切换为 `docs/screenshot-agent-chat.png`；`docs/README.md` 同步说明主图用途。
+- 对抗性审查：截图首屏保留用户侧咨询体验，不暴露后台指标、chunk_id、grounding 或工程面板；脚本校验追问区可见、标题存在、页面无横向溢出。

@@ -12,7 +12,8 @@
 | `planning/task_plan.md` | 当前任务阶段表 |
 | `planning/findings.md` | 关键发现与决策记录 |
 | `progress/` | 分日进度日志与合并进度 |
-| `screenshot-*.png` | README 与展示用截图 |
+| `screenshot-agent-chat.png` | README 主图：命盘 Agent 追问界面 |
+| `screenshot-*.png` | 历史展示截图 |
 
 ## 目录约定
 

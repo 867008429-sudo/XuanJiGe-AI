@@ -6,7 +6,7 @@
 
 当前项目仍处于内测阶段，命理解读仅作传统文化与自我观察参考，不作为医疗、投资、婚恋等现实决策依据。
 
-![玄机阁首页](docs/screenshot-landing.png)
+![玄机阁 Agent 追问界面](docs/screenshot-agent-chat.png)
 
 ## 项目亮点
 
